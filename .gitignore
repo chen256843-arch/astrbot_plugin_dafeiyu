@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 运行数据与本地配置，可能包含聊天内容、QQ 号或密钥
+data/
+*_config.json
+*.log
+
+# 打包产物
+*.zip
+dist/
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

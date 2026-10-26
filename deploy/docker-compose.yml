@@ -1,0 +1,54 @@
+# QQ 小号 + SnowLuma + AstrBot（+ DeepSeek）
+# 所有管理端口只绑定 127.0.0.1，通过 SSH 隧道访问；云服务器安全组只放行 22。
+# SnowLuma 通过反向 WebSocket 连到同一网络里的 astrbot:6199，不需要对外暴露任何 OneBot 端口。
+
+services:
+  snowluma:
+    image: motricseven7/snowluma:latest
+    container_name: snowluma
+    restart: unless-stopped
+    shm_size: 1g                  # QQ 基于 Chromium，默认 /dev/shm 会崩
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+    cap_add:
+      - SYS_PTRACE                # SnowLuma 用 ptrace 注入 QQ 进程，不能省
+    security_opt:
+      - seccomp=unconfined        # 同上，不能省
+    environment:
+      - TZ=Asia/Shanghai
+      - VNC_PASSWD=${VNC_PASSWD:-}
+    ports:
+      - "127.0.0.1:6081:6081"     # noVNC 远程桌面（扫码登录 QQ）
+      - "127.0.0.1:5099:5099"     # SnowLuma WebUI
+    volumes:
+      - qq-gateway-data:/app/data           # SnowLuma 配置与缓存
+      - qq-client-config:/app/.config       # QQ 客户端配置
+      - qq-client-data:/app/.local/share    # QQ 登录态（删了要重新扫码）
+    networks:
+      - bot
+
+  astrbot:
+    image: soulter/astrbot:latest
+    container_name: astrbot
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:6185:6185"     # AstrBot WebUI
+    volumes:
+      - ./astrbot-data:/AstrBot/data        # 配置、插件、插件数据（大肥鱼的记忆在 plugin_data 里）
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - bot
+
+networks:
+  bot:
+
+volumes:
+  qq-gateway-data:
+  qq-client-config:
+  qq-client-data:

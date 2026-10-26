@@ -1,0 +1,196 @@
+{
+  "owners": {
+    "description": "主人 QQ 号",
+    "type": "list",
+    "default": [],
+    "obvious_hint": true,
+    "hint": "只认 QQ 号，不认昵称。主人需要先私聊机器人一次，她才能主动给主人发消息。"
+  },
+  "owner_nick": {
+    "description": "主人常用昵称",
+    "type": "string",
+    "default": "",
+    "hint": "别人把昵称改得和这个相似时，会被标记为疑似冒充。"
+  },
+  "name": {
+    "description": "角色名字",
+    "type": "string",
+    "default": "大肥鱼"
+  },
+  "aliases": {
+    "description": "别名",
+    "type": "list",
+    "default": [],
+    "hint": "群里提到这些名字会提高她插话的概率。"
+  },
+  "persona": {
+    "description": "人设",
+    "type": "text",
+    "default": "",
+    "hint": "留空使用默认人设：住在浮空小岛屋子里的女孩，养了一只叫小灰的猫。"
+  },
+  "group_persona": {
+    "description": "群聊人设（可选）",
+    "type": "text",
+    "default": "",
+    "hint": "只对群聊生效，留空时群聊和私聊用同一个人设。适合群里更克制、私聊更亲近的角色。"
+  },
+  "interests": {
+    "description": "兴趣词",
+    "type": "list",
+    "default": [
+      "猫",
+      "书",
+      "花",
+      "种菜",
+      "天气",
+      "海"
+    ],
+    "hint": "群聊里出现这些词会提高触发概率。"
+  },
+  "home": {
+    "description": "小岛所在的气象地点",
+    "type": "string",
+    "default": "海",
+    "options": [
+      "海",
+      "云海",
+      "森林",
+      "雪山",
+      "城市",
+      "沙漠",
+      "极夜",
+      "旧城"
+    ]
+  },
+  "groups": {
+    "description": "允许参与的群号",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示所有群。"
+  },
+  "group_p0": {
+    "description": "群聊基础触发概率 p₀",
+    "type": "float",
+    "default": 0.03,
+    "slider": {
+      "min": 0,
+      "max": 0.3,
+      "step": 0.01
+    },
+    "hint": "p = min(0.85, p₀ + 0.12·r)；被 @ 或引用时必回。"
+  },
+  "proactive": {
+    "description": "允许主动给主人发消息",
+    "type": "bool",
+    "default": true
+  },
+  "segment_reply": {
+    "description": "逐句分条发送",
+    "type": "string",
+    "default": "private",
+    "options": [
+      "private",
+      "all",
+      "off"
+    ],
+    "labels": [
+      "仅私聊",
+      "私聊和群聊",
+      "关闭"
+    ],
+    "hint": "需要在 AstrBot 配置里开启「分段回复」。开启后回复按句切开，间隔一两秒逐条发出。"
+  },
+  "quiet_start": {
+    "description": "免打扰开始（时）",
+    "type": "int",
+    "default": 23
+  },
+  "quiet_end": {
+    "description": "免打扰结束（时）",
+    "type": "int",
+    "default": 8
+  },
+  "timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "作息、日记、夜间巩固都按这个时区算。"
+  },
+  "llm_source": {
+    "description": "对话模型来源",
+    "type": "string",
+    "default": "astrbot",
+    "options": [
+      "astrbot",
+      "custom"
+    ],
+    "labels": [
+      "使用 AstrBot 里配置的提供商",
+      "插件自己调用（填下面的 Key）"
+    ]
+  },
+  "llm_provider_id": {
+    "description": "使用的提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "选你在 AstrBot 里配置好的 DeepSeek。留空则跟随当前默认提供商。"
+  },
+  "llm_api_key": {
+    "description": "自定义模式：API Key",
+    "type": "string",
+    "default": "",
+    "secret": true
+  },
+  "llm_base_url": {
+    "description": "自定义模式：接口地址",
+    "type": "string",
+    "default": "https://api.deepseek.com"
+  },
+  "llm_model": {
+    "description": "自定义模式：模型",
+    "type": "string",
+    "default": "deepseek-chat"
+  },
+  "price_in": {
+    "description": "输入价格（元 / 千 token）",
+    "type": "float",
+    "default": 0.002,
+    "hint": "只用于 /成本 估算，请按 DeepSeek 官网当前价格填写。"
+  },
+  "price_out": {
+    "description": "输出价格（元 / 千 token）",
+    "type": "float",
+    "default": 0.008
+  },
+  "embedding_provider_id": {
+    "description": "嵌入模型提供商 ID（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "DeepSeek 没有向量接口。可填 AstrBot 里配置的嵌入提供商 ID；留空且下面也不填 Key 时，使用本地哈希向量。"
+  },
+  "embed_api_key": {
+    "description": "百炼 text-embedding-v4 的 API Key（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true
+  },
+  "embed_base_url": {
+    "description": "向量接口地址",
+    "type": "string",
+    "default": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "invisible": true
+  },
+  "embed_model": {
+    "description": "向量模型",
+    "type": "string",
+    "default": "text-embedding-v4",
+    "invisible": true
+  },
+  "hot_capacity": {
+    "description": "热库容量",
+    "type": "int",
+    "default": 5000
+  }
+}
