@@ -456,22 +456,35 @@ class Agent:
         self.ok("maintain")
         return fixed
 
+    def _plan_key(self, tag: str, ids: list[str]) -> tuple[str, str]:
+        node = next((self.memory.nodes[i] for i in ids if i in self.memory.nodes), {})
+        return tag, node.get("speaker", "")
+
     async def job_consolidate(self) -> dict:
-        summaries: dict[str, str] = {}
+        summaries: dict[tuple[str, str], str] = {}
         if self.llm.enabled:
             for tag, ids in self.memory.abstraction_plans():
-                texts = "\n".join(f"- {self.memory.nodes[i]['text']}" for i in ids[:8] if i in self.memory.nodes)
+                key = self._plan_key(tag, ids)
+                src = [self.memory.nodes[i] for i in ids[:8] if i in self.memory.nodes]
+                texts = "\n".join(f"- {n['text']}" for n in src)
+                sp = key[1]
+                whose = "你自己的经历" if sp == "self" else f"「{self.name_of(sp, src[0].get('speaker_name', ''))}」说的" if sp else "来源不明"
                 s = await self.llm.chat(
                     [
-                        {"role": "system", "content": "把下面几条记忆抽象成一句简短的概括（30 字以内），只输出这句话。"},
-                        {"role": "user", "content": f"主题：{tag}\n{texts}"},
+                        {
+                            "role": "system",
+                            "content": "把下面几条记忆抽象成一句简短的概括（30 字以内），保留是谁说的或经历的，只输出这句话。",
+                        },
+                        {"role": "user", "content": f"主题：{tag}\n这些都是{whose}：\n{texts}"},
                     ],
                     max_tokens=80,
                     temperature=0.3,
                 )
                 if s:
-                    summaries[tag] = s
-        report = self.memory.consolidate(lambda tag, ids: summaries.get(tag) or self.memory.template_abstraction(tag, ids))
+                    summaries[key] = s
+        report = self.memory.consolidate(
+            lambda tag, ids: summaries.get(self._plan_key(tag, ids)) or self.memory.template_abstraction(tag, ids)
+        )
         self.ok("consolidate")
         return report
 
@@ -541,7 +554,13 @@ class Agent:
             )
             if not bypass and self.rng.random() >= p:
                 if r >= 2:
-                    self.memory.propose(f"{msg.nick}在群里说：{text}", source="owner" if is_owner else "other", tags=tags)
+                    self.memory.propose(
+                        f"{msg.nick or '一位群友'}在群里说：{text}",
+                        source="owner" if is_owner else "other",
+                        tags=tags,
+                        speaker=uid,
+                        speaker_name=msg.nick,
+                    )
                 return None
             self.social.mark_replied(msg.group_id)
 
@@ -550,8 +569,14 @@ class Agent:
             if not msg.group_id and ATE_PATTERN.search(text):
                 self._feed_link()
 
-        speaker = "主人" if is_owner else msg.nick or uid
-        self.memory.propose(f"{speaker}说：{text}", source="owner" if is_owner else "other", tags=tags)
+        speaker = "主人" if is_owner else msg.nick or "对方"
+        self.memory.propose(
+            f"{speaker}说：{text}",
+            source="owner" if is_owner else "other",
+            tags=tags,
+            speaker=uid,
+            speaker_name=msg.nick,
+        )
 
         reply = await self._reply(msg, is_owner)
         self.drives.satisfy("social", 15 if is_owner else 6)
@@ -582,6 +607,7 @@ class Agent:
             drive_bias=self.drives.drive_bias,
             mood=self.drives.mood,
             temperature=temp,
+            speaker=uid,
         )
         if msg.group_id:
             hits = [h for h in hits if self._visible_in_group(h.node, uid)]
@@ -612,13 +638,32 @@ class Agent:
         users = [t for t in tags if t.startswith("user:")]
         return not users or f"user:{uid}" in users
 
+    def name_of(self, uid: str, fallback: str = "") -> str:
+        """说话人现在的称呼：主人 → 当前昵称 → 记忆里的旧昵称 → 一位群友。不把 QQ 号交给模型。"""
+        if self.social.is_owner(uid):
+            return "主人"
+        nick = self.social.rel.get(uid, {}).get("nick", "")
+        return nick or fallback or "一位群友"
+
+    def speaker_label(self, node: dict, uid: str) -> str:
+        """这条记忆是谁说的，相对当前说话人 uid 而言。"""
+        sp = node.get("speaker", "")
+        if sp == "self":
+            return "你自己的经历"
+        if not sp:
+            return "不确定是谁说的"
+        if sp == uid:
+            return "主人（就是对方）说的" if self.social.is_owner(uid) else "对方本人说的"
+        return f"{self.name_of(sp, node.get('speaker_name', ''))}说的（不是对方）"
+
     def _system_prompt(self, uid: str, msg: Incoming, hits) -> str:
         tier = self.social.tier(uid)
         rel = self.social.rel.get(uid, {})
         w = self._home_weather()
         cat = self.world.agents["小灰"]
         mem_lines = "\n".join(
-            f"- [{REGIONS.get(h.node['region'], h.node['region'])}] {h.node['text']}（{datetime.fromtimestamp(h.node['created'], self.tz).strftime('%m-%d')}）"
+            f"- 【{self.speaker_label(h.node, uid)}】{h.node['text']}"
+            f"（{datetime.fromtimestamp(h.node['created'], self.tz).strftime('%m-%d')}）"
             for h in hits
         ) or "（没有想起什么相关的）"
         taboos = "、".join(rel.get("taboos", [])) or "无"
@@ -629,8 +674,9 @@ class Agent:
             f"【此刻】{self._dt().strftime('%H:%M')}，{weather.describe(w)}。你在{self.location_text()}，正在{self.activity['name']}。"
             f"心情{self.mood_word()}。驱力：{self.drives.summary()}。小灰{cat['mode']}中。金币 {self.econ.coins}。\n"
             f"【对方】{msg.nick or uid}（{where}），关系：{tier}。相处边界：{BOUNDARY[tier]}。禁忌话题：{taboos}\n"
-            f"【想起的记忆】\n{mem_lines}\n"
+            f"【想起的记忆】每条都标了是谁说的或经历的：\n{mem_lines}\n"
             "【说话方式】像发 QQ 消息一样口语化，一般 1–3 句，不用 markdown 和列表。只根据上面的记忆谈过去的事，记不清就直说。"
+            "提到记忆时分清是谁说的：别人说的事不要说成是对方说的，也不要把对方说过的话安到别人头上。"
             "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。"
         )
 
@@ -685,9 +731,12 @@ class Agent:
         for h in hits:
             n = h.node
             bits = gua.bits_str(gua.node_bits(n, self.memory.degree(n["id"])))
+            sp = n.get("speaker", "")
+            who = "她自己" if sp == "self" else "未知" if not sp else f"{self.name_of(sp, n.get('speaker_name', ''))}({sp})"
             lines.append(
                 f"{n['id']} [{REGIONS[n['region']]}/{n['tier']}] {h.gua}({bits}) 分{h.score:.2f} "
-                f"cos{h.parts.get('cos', 0):.2f} lex{h.parts.get('lex', 0):.2f} w{h.parts.get('w', 0):.2f}\n  {n['text'][:60]}"
+                f"cos{h.parts.get('cos', 0):.2f} lex{h.parts.get('lex', 0):.2f} w{h.parts.get('w', 0):.2f}\n"
+                f"  来源：{who}\n  {n['text'][:60]}"
             )
         return "\n".join(lines)
 
@@ -697,5 +746,12 @@ class Agent:
         return f"热库 {st['hot']}/{self.memory.capacity} 冷库 {st['cold']} 边 {st['edges']} 向量 {st['vectors']} 候选池 {st['pool']}\n分区：{regions}"
 
     def remember(self, text: str, uid: str) -> str:
-        n = self.memory.write(text, source="owner" if self.social.is_owner(uid) else "other", tier="core", tags=[f"user:{uid}"])
+        n = self.memory.write(
+            text,
+            source="owner" if self.social.is_owner(uid) else "other",
+            tier="core",
+            tags=[f"user:{uid}"],
+            speaker=uid,
+            speaker_name=self.social.rel.get(uid, {}).get("nick", ""),
+        )
         return f"记住了（{n['id']}，{REGIONS[n['region']]}，{self.memory.gua_of(n['id'])}）"

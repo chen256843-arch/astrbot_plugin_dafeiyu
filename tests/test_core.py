@@ -17,7 +17,7 @@ from core.drives import Drives  # noqa: E402
 from core.ecology import Ecology  # noqa: E402
 from core.economy import Economy  # noqa: E402
 from core.embedding import hash_embed  # noqa: E402
-from core.memory import DAY, MemoryStore  # noqa: E402
+from core.memory import DAY, Hit, MemoryStore  # noqa: E402
 from core.social import Social  # noqa: E402
 from core.world import World  # noqa: E402
 
@@ -213,6 +213,103 @@ class TestEcoSocial(unittest.TestCase):
         self.assertEqual(s.tier("2"), "疑似冒充")
         self.assertFalse(s.check_impersonation("1", "小鱼干"))
         self.assertEqual(s.tier("1"), "主人")
+
+
+class TestSpeakerMemory(unittest.TestCase):
+    """记住是谁说的。"""
+
+    def setUp(self):
+        self.m = MemoryStore(rng=random.Random(0))
+
+    def test_same_words_different_people_both_kept(self):
+        self.m.propose("我最喜欢的水果是草莓", tags=["user:1"], speaker="1", speaker_name="小明")
+        self.m.propose("我最喜欢的水果是草莓", tags=["user:2"], speaker="2", speaker_name="小红")
+        self.m.propose("我最喜欢的水果是草莓", tags=["user:1"], speaker="1", speaker_name="小明")
+        written = self.m.judge()
+        self.assertEqual(sorted(n["speaker"] for n in written), ["1", "2"])  # 第三条是小明重复，只强化
+        self.assertEqual({n["speaker_name"] for n in written}, {"小明", "小红"})
+
+    def test_dedupe_only_within_one_speaker(self):
+        a = self.m.write("我们一起去码头看了很久的海浪和夕阳", region="episodic", speaker="1")
+        b = self.m.write("我们一起去码头看了很久的海浪和夕阳呀", region="episodic", speaker="2")
+        self.assertEqual(self.m.dedupe(), 0)
+        c = self.m.write("我们一起去码头看了很久的海浪和夕阳啊", region="episodic", speaker="1")
+        self.assertEqual(self.m.dedupe(), 1)
+        self.assertIn(b["id"], self.m.nodes)
+        self.assertTrue((a["id"] in self.m.nodes) ^ (c["id"] in self.m.nodes))
+
+    def test_current_speaker_recalled_first(self):
+        a = self.m.write("小明说：我养了一只橘猫叫大黄", speaker="1", speaker_name="小明")
+        b = self.m.write("小红说：我养了一只橘猫叫团子", speaker="2", speaker_name="小红")
+        for n in (a, b):
+            self.m.set_vector(n["id"], "hash512", hash_embed(n["text"]))
+        q = "我养的猫叫什么"
+        for uid, want in (("1", a["id"]), ("2", b["id"])):
+            m = MemoryStore.from_dict(self.m.to_dict(), self.m.vectors, rng=random.Random(0))
+            hits = m.retrieve(q, k=2, query_vec=hash_embed(q), backend="hash512", speaker=uid, temperature=0)
+            self.assertEqual(hits[0].node["id"], want)
+
+    def test_abstraction_per_speaker_keeps_privacy(self):
+        for t in ("我家猫今天打翻了水杯", "我家猫昨天抓了一只虫", "我家猫跟着我去了码头"):
+            self.m.write(t, region="episodic", tags=["猫", "user:1"], speaker="1", speaker_name="小明")
+        for t in ("群里的猫图好可爱", "猫猫表情包又更新了", "有人在群里晒猫"):
+            self.m.write(t, region="episodic", tags=["猫", "user:2", "group:g"], speaker="2", speaker_name="小红")
+        plans = self.m.abstraction_plans()
+        self.assertEqual(len(plans), 2)
+        self.m.consolidate()
+        abstracts = [n for n in self.m.nodes.values() if n["region"] == "semantic"]
+        by_speaker = {n["speaker"]: n for n in abstracts}
+        self.assertEqual(set(by_speaker), {"1", "2"})
+        self.assertIn("user:1", by_speaker["1"]["tags"])
+        self.assertFalse(any(t.startswith("group:") for t in by_speaker["1"]["tags"]))  # 私聊来源的概括不进群
+        self.assertIn("group:g", by_speaker["2"]["tags"])
+        self.assertIn("小明", by_speaker["1"]["text"])
+
+    def test_old_memories_migrated(self):
+        old = {
+            "nodes": {
+                "m1": {"id": "m1", "text": "小明说：我喜欢草莓", "region": "episodic", "tier": "normal",
+                       "tags": ["user:7"], "source": "other", "created": 1.0, "last_access": 1.0, "w0": 1.0},
+                "m2": {"id": "m2", "text": "在书房读了一会儿书", "region": "episodic", "tier": "normal",
+                       "tags": ["自主"], "source": "self", "created": 1.0, "last_access": 1.0, "w0": 1.0},
+            },
+            "counter": 2,
+        }
+        m = MemoryStore.from_dict(old)
+        self.assertEqual(m.nodes["m1"]["speaker"], "7")
+        self.assertEqual(m.nodes["m2"]["speaker"], "self")
+        self.assertEqual(m.maintain(), {})
+
+    def test_prompt_labels_who_said_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            a.social.touch("2", "小红")
+            mine = a.memory.write("主人说：我下周要考试", speaker="1")
+            hers = a.memory.write("小红说：我下周要搬家", speaker="2", speaker_name="小红")
+            own = a.memory.write("在书房读了一会儿书", source="self")
+            hits = [Hit(n, 1.0) for n in (mine, hers, own)]
+            to_owner = a._system_prompt("1", Incoming("1", "主人", "hi"), hits)
+            self.assertIn("【主人（就是对方）说的】主人说：我下周要考试", to_owner)
+            self.assertIn("【小红说的（不是对方）】小红说：我下周要搬家", to_owner)
+            self.assertIn("【你自己的经历】在书房读了一会儿书", to_owner)
+            to_red = a._system_prompt("2", Incoming("2", "小红", "hi"), hits)
+            self.assertIn("【对方本人说的】小红说：我下周要搬家", to_red)
+            self.assertIn("【主人说的（不是对方）】", to_red)
+            self.assertNotIn("1", a.speaker_label(mine, "2").replace("主人", ""))  # 不把 QQ 号交给模型
+
+    def test_on_message_records_speaker(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+
+            async def run():
+                await a.on_message(Incoming("1", "想睡觉", "我最喜欢的水果是草莓"))
+                await a.on_message(Incoming("2", "小红", "我最喜欢的水果是草莓", group_id="g", is_tome=True))
+                await a.job_ingest()
+
+            asyncio.run(run())
+            nodes = sorted(a.memory.nodes.values(), key=lambda n: n["speaker"])
+            self.assertEqual([(n["speaker"], n["speaker_name"]) for n in nodes], [("1", "想睡觉"), ("2", "小红")])
+            self.assertIn("来源：主人(1)", a.memory_text("草莓"))
 
 
 class TestHostHooks(unittest.TestCase):

@@ -36,6 +36,7 @@ HOT_CAPACITY = 5000
 # 检索融合系数
 COS_W, LEX_W, PPR_W = 0.65, 0.35, 0.20
 FLASH_BOOST, INTENT_BOOST = 1.45, 1.35
+SPEAKER_BOOST = 1.25
 GUA_DECAY = (1.0, 0.86, 0.72, 0.60)
 JITTER = 0.175
 
@@ -116,6 +117,16 @@ def infer_drive(text: str) -> str | None:
 
 def extract_tags(text: str) -> list[str]:
     return [w for w in _TOPIC_WORDS if w in text]
+
+
+def speaker_of(item: dict) -> str:
+    """说话人：显式 speaker 字段 → user: 标签 → 角色自己（"self"）→ 未知（""）。"""
+    if item.get("speaker"):
+        return str(item["speaker"])
+    for tag in item.get("tags", ()):
+        if tag.startswith("user:"):
+            return tag[5:]
+    return "self" if item.get("source") == "self" else ""
 
 
 @dataclass
@@ -201,31 +212,37 @@ class MemoryStore:
             self.last_written = None
 
     # ------------------------------------------------------------------ 编码
-    def surprise(self, text: str) -> tuple[float, str | None]:
-        """s = 1 − max_i Jaccard(text, m_i)，返回 (s, 最相似节点)。"""
+    def surprise(self, text: str, speaker: str | None = None) -> tuple[float, str | None]:
+        """s = 1 − max_i Jaccard(text, m_i)，返回 (s, 最相似节点)。给出 speaker 时只和同一人的记忆比。"""
         cs = char_set(text)
         best, best_id = 0.0, None
         for nid, other in self._chars.items():
+            if speaker is not None and self.nodes[nid].get("speaker", "") != speaker:
+                continue
             j = jaccard(cs, other)
             if j > best:
                 best, best_id = j, nid
         return 1.0 - best, best_id
 
     def propose(self, text: str, source: str = "other", **meta) -> None:
-        """候选池：先暂存，由 judge() 统一判断是否写入。"""
+        """候选池：先暂存，由 judge() 统一判断是否写入。meta 为 write() 的关键字参数。"""
         text = text.strip()
         if text:
             self.pool.append({"text": text, "source": source, "ts": now(), **meta})
 
     def judge(self, min_surprise: float = 0.12) -> list[dict]:
-        """候选池 → 判断阶段。过短、寒暄或几乎重复（只强化旧节点）的不写入。"""
+        """候选池 → 判断阶段。过短、寒暄，或同一个人几乎重复说过的（只强化旧节点）不写入。
+
+        别人说过相似的话不算重复：谁说的本身就是要记住的信息。
+        """
         written: list[dict] = []
         pool, self.pool = self.pool, []
         for c in pool:
             text = c.pop("text")
             if len(char_set(text)) < 4 or text.strip().lower() in _TRIVIAL:
                 continue
-            s, sim_id = self.surprise(text)
+            speaker = speaker_of(c)
+            s, sim_id = self.surprise(text, speaker)
             if s < min_surprise and sim_id:
                 self._rehearse(sim_id)
                 continue
@@ -248,7 +265,10 @@ class MemoryStore:
         arousal: float | None = None,
         ts: float | None = None,
         link_to: Iterable[str] = (),
+        speaker: str | None = None,
+        speaker_name: str = "",
     ) -> dict:
+        """写入一条记忆。speaker 为说话人 QQ 号；角色自己的经历为 "self"；不给时从标签推断。"""
         t = ts or now()
         s, _ = self.surprise(text)
         v, a = affect(text)
@@ -269,6 +289,8 @@ class MemoryStore:
             "tier": tier,
             "tags": sorted(set(extract_tags(text)) | set(tags)),
             "source": source,
+            "speaker": "",
+            "speaker_name": speaker_name,
             "created": t,
             "last_access": t,
             "hits": 0,
@@ -280,6 +302,7 @@ class MemoryStore:
             "recalls": [],
             "merged": 0,
         }
+        node["speaker"] = speaker if speaker is not None else speaker_of(node)
         self.nodes[nid] = node
         self._index(nid)
         # 时间邻近边（有向，前向更强）
@@ -375,7 +398,9 @@ class MemoryStore:
         temperature: float = 1.0,
         update: bool = True,
         min_score: float = 0.08,
+        speaker: str | None = None,
     ) -> list[Hit]:
+        """speaker 为当前说话人：他自己说过的事优先想起（×SPEAKER_BOOST）。"""
         if not self.nodes:
             return []
         t = now()
@@ -411,8 +436,9 @@ class MemoryStore:
             recent = sum(1 for ts in node.get("recalls", []) if t - ts < 6 * HOUR)
             rum = 0.75 ** (recent - 1) if recent >= 2 else 1.0
             jitter = 1.0 + self.rng.uniform(-JITTER, JITTER) * temperature
-            score = fused * node_w * d_bias * v_bias * r_boost * rum * jitter
-            parts[nid].update(ppr=round(pr, 3), w=round(w, 3), region=r_boost, rum=round(rum, 3))
+            s_boost = SPEAKER_BOOST if speaker and node.get("speaker") == speaker else 1.0
+            score = fused * node_w * d_bias * v_bias * r_boost * rum * s_boost * jitter
+            parts[nid].update(ppr=round(pr, 3), w=round(w, 3), region=r_boost, rum=round(rum, 3), speaker=s_boost)
             scored.append((score, nid))
         scored.sort(reverse=True)
         pool = scored[: max(50, k * 8)]
@@ -508,6 +534,8 @@ class MemoryStore:
             na, nb = self.nodes[a], self.nodes[b]
             if "flash" in (na["region"], nb["region"]):
                 continue
+            if na.get("speaker", "") != nb.get("speaker", ""):
+                continue  # 不同的人说的相似的话不合并，否则会记错是谁说的
             if na["region"] != nb["region"] and not (set(na["tags"]) & set(nb["tags"])):
                 continue
             ca, cb = self._chars[a], self._chars[b]
@@ -538,26 +566,46 @@ class MemoryStore:
         self._remove_node(drop)
 
     def abstraction_plans(self, min_size: int = 3, window_days: float = 7.0) -> list[tuple[str, list[str]]]:
-        """同一主题标签下近期 ≥3 条情节记忆 → 待抽象为一条语义记忆。"""
+        """同一个人、同一主题标签下近期 ≥3 条情节记忆 → 待抽象为一条语义记忆。
+
+        按人分组，概括里不会把不同人的事混在一起。
+        """
         t = now()
-        groups: dict[str, list[str]] = defaultdict(list)
+        groups: dict[tuple[str, str], list[str]] = defaultdict(list)
         for nid, node in self.nodes.items():
             if node["region"] in ("episodic", "flash") and t - node["created"] < window_days * DAY:
                 for tag in node["tags"]:
                     if ":" not in tag and tag not in node.get("abstracted", []):
-                        groups[tag].append(nid)
-        return [(tag, ids) for tag, ids in groups.items() if len(ids) >= min_size]
+                        groups[(tag, node.get("speaker", ""))].append(nid)
+        return [(tag, ids) for (tag, _), ids in groups.items() if len(ids) >= min_size]
 
     def apply_abstraction(self, tag: str, ids: list[str], text: str) -> dict:
-        node = self.write(text, source="self", region="semantic", tier="important", tags=[tag], link_to=ids)
-        for nid in ids:
-            if nid in self.nodes:
-                self.nodes[nid].setdefault("abstracted", []).append(tag)
+        """写入概括。说话人和可见范围随来源：都来自同一个群才带群标签，否则按私聊对待。"""
+        src = [self.nodes[i] for i in ids if i in self.nodes]
+        speaker = src[0].get("speaker", "") if src else ""
+        scope = [g for g in src[0]["tags"] if g.startswith("group:")] if src else []
+        scope = [g for g in scope if all(g in n["tags"] for n in src)]
+        user_tags = [f"user:{speaker}"] if speaker and speaker != "self" else []
+        node = self.write(
+            text,
+            source="self",
+            region="semantic",
+            tier="important",
+            tags=[tag, *user_tags, *scope],
+            link_to=ids,
+            speaker=speaker,
+            speaker_name=src[0].get("speaker_name", "") if src else "",
+        )
+        for n in src:
+            n.setdefault("abstracted", []).append(tag)
         return node
 
     def template_abstraction(self, tag: str, ids: list[str]) -> str:
-        snippets = [self.nodes[i]["text"][:24] for i in ids[:3] if i in self.nodes]
-        return f"关于「{tag}」最近有 {len(ids)} 件事：" + "；".join(snippets)
+        src = [self.nodes[i] for i in ids if i in self.nodes]
+        snippets = [n["text"][:24] for n in src[:3]]
+        who = (src[0].get("speaker_name") or "") if src else ""
+        head = f"关于「{tag}」，{who}最近提到 {len(ids)} 件事：" if who else f"关于「{tag}」最近有 {len(ids)} 件事："
+        return head + "；".join(snippets)
 
     def prune_edges(self, decay: float = 0.95, floor: float = 0.05) -> int:
         removed = 0
@@ -637,6 +685,10 @@ class MemoryStore:
             if not isinstance(node.get("tags"), list):
                 node["tags"] = extract_tags(node["text"])
                 fixed["tags"] += 1
+            if "speaker" not in node:
+                node["speaker"] = speaker_of(node)
+                node.setdefault("speaker_name", "")
+                fixed["speaker"] += 1
         for nid in list(self.vectors):
             if nid not in self.nodes:
                 del self.vectors[nid]
@@ -683,6 +735,9 @@ class MemoryStore:
             m.counter = d.get("counter", len(m.nodes))
             m.last_written = d.get("last_written")
         m.vectors = vectors or {}
-        for nid in m.nodes:
+        for nid, node in m.nodes.items():
+            if "speaker" not in node:  # 0.4.0 之前的记忆：从标签补出说话人
+                node["speaker"] = speaker_of(node)
+                node.setdefault("speaker_name", "")
             m._index(nid)
         return m
