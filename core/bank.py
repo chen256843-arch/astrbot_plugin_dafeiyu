@@ -233,7 +233,7 @@ class MemoryBank:
                 rng=bank.rng,
             )
             bank.stores[key] = st
-            bank.meta[key] = {"name": m.get("name", ""), "last": m.get("last", 0.0)}
+            bank.meta[key] = {"name": "", "last": 0.0, **{k: v for k, v in m.items() if k != "file"}}
         return bank
 
     @classmethod

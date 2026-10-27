@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import gua, sun, weather
+from . import cards, gua, sun, weather
 from .collapse import collapse, pick
 from .drives import DRIVES, Drives
 from .ecology import CROPS, Ecology
@@ -38,6 +38,7 @@ JOB_INTERVALS = {
     "maintain": 3600,
     "consolidate": DAY,
     "diary": DAY,
+    "cards": DAY,
     "selftest": 6 * HOUR,
     "save": 300,
 }
@@ -49,11 +50,27 @@ SUMMARY_MAX = 80
 # 按需检索：低于 max(绝对下限, 首条分数 × 相对比例) 的记忆不放进提示词
 RECALL_FLOOR = 0.12
 RECALL_RELATIVE = 0.35
+RECALL_K = 6
+RECALL_K_WITH_CARD = 4  # 对方有印象卡时，具体记忆最多放几条
 SMALL_TALK = {
     "嗯", "嗯嗯", "嗯呢", "哦", "哦哦", "噢", "啊", "好", "好的", "好滴", "好哒", "行", "可以", "ok", "okk", "收到",
     "哈", "哈哈", "哈哈哈", "哈哈哈哈", "嘿嘿", "嘻嘻", "呵呵", "666", "6", "早", "早安", "晚安", "拜拜", "在", "在吗",
     "谢谢", "谢啦", "对", "对的", "是的", "没事", "嗷", "呜呜",
 }
+
+
+# 状态行：驱力超过阈值才化成一句话
+DRIVE_STRONG = 70
+DRIVE_PHRASES = {
+    "social": "有点想找人说话",
+    "curiosity": "对什么都挺好奇",
+    "play": "想出去玩",
+    "rest": "有点困",
+    "recognition": "想被人夸夸",
+    "achievement": "想把手头的事做完",
+}
+CAT_WORDS = ("猫", "小灰")
+MONEY_WORDS = ("钱", "金币", "买", "卖", "穷", "富")
 
 
 def is_small_talk(text: str) -> bool:
@@ -83,10 +100,14 @@ class Settings:
     llm_api_key: str = ""
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-chat"
-    price_in: float = 0.002  # 每千 token（元），按模型官网价格调整
+    price_in: float = 0.002  # 每千 token（元），输入未命中缓存；按模型官网价格调整
+    price_in_hit: float = 0.0005  # 输入命中缓存
     price_out: float = 0.008
     hot_capacity: int = 5000
     tz: str = "Asia/Shanghai"
+    card_enabled: bool = True
+    card_min_new: int = 3  # 一个人至少有几条新记忆才调用模型更新他的卡片
+    card_max_people: int = 30  # 每次最多整理几个人，控制费用
 
 
 @dataclass
@@ -109,7 +130,14 @@ class Agent:
         self.econ = Economy()
         self.social = Social(set(settings.owners), settings.owner_nick)
         self.embedder = Embedder(settings.embed_api_key, settings.embed_base_url, settings.embed_model)
-        self.llm = LLM(settings.llm_api_key, settings.llm_base_url, settings.llm_model, settings.price_in, settings.price_out)
+        self.llm = LLM(
+            settings.llm_api_key,
+            settings.llm_base_url,
+            settings.llm_model,
+            settings.price_in,
+            settings.price_out,
+            price_in_hit=settings.price_in_hit,
+        )
         try:
             self.tz = ZoneInfo(settings.tz)
         except Exception:  # noqa: BLE001  容器里缺时区数据时退回东八区
@@ -129,6 +157,7 @@ class Agent:
         self.summaries: dict[str, str] = {}  # 会话 → 更早对话的前情提要
         self._compressing: set[str] = set()
         self._bg: set[asyncio.Task] = set()
+        self.card_backend = None  # 整理印象卡用的模型；None 则和聊天用同一个
 
     # ================================================================ 持久化
     @property
@@ -550,6 +579,116 @@ class Agent:
         self.ok("diary")
         return text
 
+    # ================================================================ 印象卡
+    def card(self, key: str) -> dict | None:
+        return self.bank.meta.get(key, {}).get("card")
+
+    def card_line(self, key: str) -> str:
+        """给模型看的一行印象；她自己的卡是一句「最近的生活」。"""
+        c = self.card(key)
+        if not c:
+            return ""
+        return c.get("text", "") if key == SELF else cards.render(c)
+
+    def card_text(self, key: str) -> str:
+        """/印象 命令用的完整展示。"""
+        c = self.card(key)
+        if not c:
+            return "还没有整理过印象卡（每晚自动整理，主人也可以发 /整理卡片）"
+        now_dt = self._dt()
+        when = time_label(c["updated"], now_dt, self.tz) if c.get("updated") else "从未"
+        if key == SELF:
+            return f"她最近的生活（{when}整理）：\n{c.get('text', '')}"
+        lines = [f"对{self._whose(key)}的印象（{when}整理）：", c.get("profile") or "（还没有概括）"]
+        cur = cards.current_facts(c)
+        if cur:
+            lines.append("记得：" + "；".join(f["text"] for f in cur))
+        past = cards.past_facts(c)
+        if past:
+            lines.append("以前：" + "；".join(f"{f['text']}（{time_label(f['until'], now_dt, self.tz)}变了）" for f in past))
+        return "\n".join(lines)
+
+    def _new_memories(self, key: str, since: float, limit: int = 30) -> list[str]:
+        st = self.bank.stores.get(key)
+        if not st:
+            return []
+        now_dt = self._dt()
+        nodes = sorted((n for n in st.nodes.values() if n["created"] > since), key=lambda n: n["created"])[-limit:]
+        return [f"{time_label(n['created'], now_dt, self.tz)}：{n['text']}" for n in nodes]
+
+    async def job_cards(self) -> dict:
+        report = await self.update_cards()
+        self.ok("cards")
+        return report
+
+    async def update_cards(self, keys: list[str] | None = None, force: bool = False) -> dict:
+        """主动调用模型整理印象卡。
+
+        定时：只整理自上次以来新记忆 ≥ card_min_new 条的人（第一次 ≥ 1 条即可），按新记忆多少排序，
+        最多 card_max_people 个；再更新她自己的「最近的生活」。
+        手动（force）：不看门槛和人数上限，有新记忆就整理。keys 指定只整理哪些人。
+        """
+        report: dict = {"updated": [], "failed": [], "skipped": 0, "self": False}
+        if not self.llm.enabled:
+            report["error"] = "没有可用的模型"
+            return report
+        cands = []
+        for key in keys if keys is not None else list(self.bank.stores):
+            if key == SELF or key not in self.bank.stores:
+                continue
+            card = self.card(key) or cards.empty_card()
+            new = self._new_memories(key, card.get("updated", 0.0))
+            need = self.s.card_min_new if card.get("updated") else 1
+            if new and (force or len(new) >= need):
+                cands.append((len(new), key, new))
+            else:
+                report["skipped"] += 1
+        cands.sort(key=lambda c: -c[0])
+        limit = len(cands) if force else max(0, self.s.card_max_people)
+        report["skipped"] += max(0, len(cands) - limit)
+        for _, key, new in cands[:limit]:
+            (report["updated"] if await self._update_card(key, new) else report["failed"]).append(key)
+        if keys is None or SELF in keys:
+            report["self"] = await self._update_self_card(force)
+        return report
+
+    async def _update_card(self, key: str, new: list[str]) -> bool:
+        t0 = now()  # 以发请求前为准：等待期间新写入的记忆留到下次
+        card = self.card(key) or cards.empty_card()
+        messages = cards.update_messages(self.s.name, self._whose(key), card, new, self.summaries.get(f"p:{key}", ""))
+        out = await self.llm.chat(messages, max_tokens=400, temperature=0.2, backend=self.card_backend)
+        data = cards.parse_json(out)
+        if data is None:
+            log.warning("整理 %s 的印象卡失败，模型没有给出 JSON：%s", key, (out or "")[:80])
+            return False
+        profile = str(data.get("profile", "")).strip()
+        if profile:
+            card["profile"] = profile[: cards.PROFILE_MAX]
+        cards.apply_ops(card, data.get("ops", []), t0)
+        card["updated"] = t0
+        self.bank.meta.setdefault(key, {"name": "", "last": 0.0})["card"] = card
+        return True
+
+    async def _update_self_card(self, force: bool = False) -> bool:
+        t0 = now()
+        card = self.card(SELF) or {"text": "", "updated": 0.0}
+        since = card.get("updated", 0.0)
+        lived = self._new_memories(SELF, since, limit=15)
+        lived += [e["text"] for e in self.events if e["ts"] > since][-15:]
+        if not lived or (len(lived) < 3 and not force):
+            return False
+        out = await self.llm.chat(
+            cards.self_messages(self.s.name, self.s.persona, card.get("text", ""), lived),
+            max_tokens=120,
+            temperature=0.5,
+            backend=self.card_backend,
+        )
+        if not out:
+            return False
+        self.bank.store(SELF)  # 确保有这个库，元数据才会随存档保存
+        self.bank.meta[SELF]["card"] = {"text": out.strip()[: cards.SELF_MAX + 10], "updated": t0}
+        return True
+
     def job_selftest(self) -> list[str]:
         problems = []
         names = {gua.encode_bits([(i >> b) & 1 for b in range(6)]) for i in range(64)}
@@ -633,11 +772,12 @@ class Agent:
         hist = self.history.setdefault(key, [])
         user_line = msg.text if not msg.group_id else f"{msg.nick or '一位群友'}：{msg.text}"
         light = is_small_talk(msg.text)
-        hits = [] if light else await self._recall(msg, uid, hist)
+        weights = {} if light else self.bank.route(msg.text, uid, self._aliases())
+        hits = [] if light else await self._recall(msg, uid, hist, weights)
 
         reply = None
         if self.llm.enabled:
-            content = user_line if light else f"{self._context_block(uid, msg, hits)}\n{user_line}"
+            content = user_line if light else f"{self._context_block(uid, msg, hits, weights)}\n{user_line}"
             messages = [
                 {"role": "system", "content": self._system_prompt(uid, msg, key)},
                 *hist,
@@ -653,15 +793,21 @@ class Agent:
         self._maybe_compress(key)
         return reply
 
-    async def _recall(self, msg: Incoming, uid: str, hist: list[dict]) -> list[BankHit]:
-        """按需检索：只留明显相关的，去掉最近对话里已经说过的，再对用上的做检索强化。"""
+    async def _recall(
+        self, msg: Incoming, uid: str, hist: list[dict], weights: dict[str, float] | None = None
+    ) -> list[BankHit]:
+        """按需检索：只留明显相关的，去掉最近对话里已经说过的，再对用上的做检索强化。
+
+        对方已有印象卡时，稳定的事实已经在卡上，具体记忆少放几条。
+        """
         _, vecs = await self.embedder.embed([msg.text])
         _, temp = self.drives.recall_temperature(self.rng)
-        weights = self.bank.route(msg.text, uid, self._aliases())
+        if weights is None:
+            weights = self.bank.route(msg.text, uid, self._aliases())
         hits = self.bank.retrieve(
             msg.text,
             weights,
-            k=6,
+            k=RECALL_K_WITH_CARD if self.card_line(uid) else RECALL_K,
             visible=lambda key, node: self._visible(key, node, uid, msg.group_id),
             update=False,
             query_vec=vecs[0] if vecs else None,
@@ -798,38 +944,81 @@ class Agent:
         tier = self.social.tier(uid)
         taboos = "、".join(self.social.rel.get(uid, {}).get("taboos", [])) or "无"
         who = "主人" if self.social.is_owner(uid) else msg.nick or "对方"
-        return f"{who}，关系：{tier}。相处边界：{BOUNDARY[tier]}。禁忌话题：{taboos}"
+        return f"{who}，关系：{tier}。相处边界：{BOUNDARY[tier].rstrip('。')}。禁忌话题：{taboos}"
 
     def _system_prompt(self, uid: str, msg: Incoming, key: str | None = None) -> str:
-        """不随轮次变化的部分：人设、说话方式、私聊对象（群聊里对象每条都不同，放到〈此刻〉）、前情提要。"""
+        """不随轮次变化的部分：人设、她最近的生活、说话方式、私聊对象及印象卡、前情提要。
+
+        印象卡每晚才更新，白天不变，放在这里能命中缓存。群聊里对象每条都不同，对象和印象放到〈此刻〉。
+        """
         persona = self.s.group_persona if (msg.group_id and self.s.group_persona) else self.s.persona
-        parts = [
-            f"你是「{self.s.name}」。{persona}",
+        parts = [f"你是「{self.s.name}」。{persona}"]
+        life = self.card_line(SELF)
+        if life:
+            parts.append(f"【你最近的生活】{life}")
+        parts.append(
             "【说话方式】像发 QQ 消息一样口语化，一般 1–3 句，不用 markdown 和列表。"
             "对方消息前的〈此刻〉…〈/此刻〉是你此刻的状态和想起的事，只作参考，不要复述，也不要提到这些标签。"
-            "只根据想起的记忆谈过去的事，记不清就直说。提到记忆时分清是谁说的，不要张冠李戴。"
-            "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。",
-        ]
+            "只根据印象和想起的记忆谈过去的事，记不清就直说。提到记忆时分清是谁说的，不要张冠李戴。"
+            "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。"
+        )
         if msg.group_id:
             parts.append("【场景】群聊，有多位群友，每条消息前标了说话人的昵称。")
         else:
             parts.append(f"【对方】{self._relation_line(uid, msg)}")
+            impression = self.card_line(uid)
+            if impression:
+                parts.append(f"【你对{self._whose(uid)}的印象】{impression}")
         summary = self.summaries.get(key or "", "")
         if summary:
             parts.append(f"【前情提要】{summary}")
         return "\n".join(parts)
 
-    def _context_block(self, uid: str, msg: Incoming, hits: list[BankHit]) -> str:
-        """每轮都变的部分，附在这句话前面（在请求的最末尾，不影响前面的缓存）。"""
-        w = self._home_weather()
-        cat = self.world.agents["小灰"]
-        lines = [
-            "〈此刻〉",
-            f"{self._dt().strftime('%H:%M')}，{weather.describe(w)}。你在{self.location_text()}，正在{self.activity['name']}。"
-            f"心情{self.mood_word()}。驱力：{self.drives.summary()}。小灰{cat['mode']}中。金币 {self.econ.coins}。",
-        ]
+    def status_line(self, text: str = "") -> str:
+        """此刻的状态，一句话：时间、天气、在哪做什么，加上明显的感受。
+
+        人感觉不到「疲劳 73」，只会觉得「有点困」：驱力只在超过阈值时化成一句话，
+        心情只在明显好坏时提，小灰和金币只在聊到时提。
+        """
+        parts = [f"{self._dt().strftime('%H:%M')}，{weather.describe_short(self._home_weather())}"]
+        parts.append(f"你在{self.location_text()}{self.activity['name']}")
+        feelings = []
+        if self.drives.napping:
+            feelings.append("困得直打盹")
+        strong = sorted((d for d in DRIVES if self.drives.value[d] >= DRIVE_STRONG), key=lambda d: -self.drives.value[d])
+        feelings += [DRIVE_PHRASES[d] for d in strong if not (d == "rest" and self.drives.napping)][:2]
+        if self.body["hunger"] >= 70:
+            feelings.append("有点饿")
+        m = self.drives.mood
+        if m > 0.5 or m <= -0.15:
+            feelings.append(f"心情{self.mood_word()}")
+        if feelings:
+            parts.append("，".join(feelings))
+        if any(w in text for w in CAT_WORDS):
+            cat = self.world.agents["小灰"]
+            parts.append(f"小灰在{cat['mode']}")
+        if any(w in text for w in MONEY_WORDS):
+            parts.append(f"手里有 {self.econ.coins} 金币")
+        return "。".join(parts) + "。"
+
+    def _context_block(
+        self, uid: str, msg: Incoming, hits: list[BankHit], weights: dict[str, float] | None = None
+    ) -> str:
+        """每轮都变的部分，附在这句话前面（在请求的最末尾，不影响前面的缓存）。
+
+        群聊：说话人及你对 TA 的印象。私聊里主人点名问起别人时：附上你对那个人的印象。
+        别人的印象卡由其私聊内容整理而来，所以只给主人看，群里不给。
+        """
+        lines = ["〈此刻〉", self.status_line(msg.text)]
         if msg.group_id:
             lines.append(f"说话的是{self._relation_line(uid, msg)}")
+            impression = self.card_line(uid)
+            if impression:
+                lines.append(f"你对TA的印象：{impression}")
+        elif self.social.is_owner(uid):
+            for key in weights or {}:
+                if key not in (uid, SELF) and weights[key] >= 1.0 and self.card_line(key):
+                    lines.append(f"你对{self._whose(key)}的印象：{self.card_line(key)}")
         if hits:
             lines.append("想起的事（按人分组，前面是大概时间）：")
             lines.append(self.memory_block(hits, uid))

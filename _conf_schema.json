@@ -35,6 +35,37 @@
     "default": "",
     "hint": "只对群聊生效，留空时群聊和私聊用同一个人设。适合群里更克制、私聊更亲近的角色。"
   },
+  "card_enabled": {
+    "description": "每晚整理印象卡",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后每晚主动调用模型，为当天有新记忆的人整理一张印象卡（是谁、什么关系、最近怎样、记得的事实），并更新她自己最近的生活。卡片常驻在提示词里。"
+  },
+  "card_time": {
+    "description": "整理印象卡的时间",
+    "type": "string",
+    "default": "03:30",
+    "hint": "24 小时制，按插件配置的时区。默认在 03:00 夜间巩固之后。"
+  },
+  "card_provider_id": {
+    "description": "整理印象卡用的模型（可选）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "可以选一个更便宜的模型专门整理卡片；留空则和聊天用同一个。"
+  },
+  "card_min_new": {
+    "description": "至少几条新记忆才整理",
+    "type": "int",
+    "default": 3,
+    "hint": "一个人自上次整理以来新记忆少于这个数就跳过，省钱。第一次整理只要有 1 条。手动 /整理卡片 不受此限制。"
+  },
+  "card_max_people": {
+    "description": "每晚最多整理几个人",
+    "type": "int",
+    "default": 30,
+    "hint": "按新记忆多少排序，超出的留到下次。每人约一次模型调用。"
+  },
   "interests": {
     "description": "兴趣词",
     "type": "list",
@@ -154,10 +185,16 @@
     "default": "deepseek-chat"
   },
   "price_in": {
-    "description": "输入价格（元 / 千 token）",
+    "description": "输入未命中缓存的价格（元 / 千 token）",
     "type": "float",
     "default": 0.002,
     "hint": "只用于 /成本 估算，请按 DeepSeek 官网当前价格填写。"
+  },
+  "price_in_hit": {
+    "description": "输入命中缓存的价格（元 / 千 token）",
+    "type": "float",
+    "default": 0.0005,
+    "hint": "DeepSeek 对与之前请求开头相同的部分按更低的「缓存命中」价计费。只用于 /成本 估算，请按 DeepSeek 官网当前价格填写（官网通常按每百万 token 标价，除以 1000 即为每千 token）。"
   },
   "price_out": {
     "description": "输出价格（元 / 千 token）",

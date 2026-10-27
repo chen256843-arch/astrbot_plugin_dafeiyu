@@ -32,11 +32,19 @@ LOCATIONS: dict[str, tuple[float, float]] = {
 }
 
 
+def sky(w: dict) -> str:
+    return "下雨" if w.get("precipitation", 0) > 0.2 else "阴" if w.get("cloud", 0) > 0.7 else "多云" if w.get("cloud", 0) > 0.3 else "晴"
+
+
 def describe(w: dict) -> str:
     if not w:
         return "天气未知"
-    sky = "下雨" if w.get("precipitation", 0) > 0.2 else "阴" if w.get("cloud", 0) > 0.7 else "多云" if w.get("cloud", 0) > 0.3 else "晴"
-    return f"{sky} {w.get('temp', 0):.0f}°C 湿度{w.get('humidity', 0):.0f}% 风{w.get('wind', 0):.0f}km/h"
+    return f"{sky(w)} {w.get('temp', 0):.0f}°C 湿度{w.get('humidity', 0):.0f}% 风{w.get('wind', 0):.0f}km/h"
+
+
+def describe_short(w: dict) -> str:
+    """给模型看的：只要天色和温度。"""
+    return f"{sky(w)} {w.get('temp', 0):.0f}°C" if w else ""
 
 
 async def fetch(lat: float, lon: float) -> dict:

@@ -542,6 +542,122 @@ class TestPromptCache(unittest.TestCase):
             self.assertEqual(b.summaries, {"p:1": "之前聊到：工作"})
 
 
+class TestCards(unittest.TestCase):
+    """印象卡：模型每晚整理，事实带有效期，常驻提示词。"""
+
+    def test_apply_ops_keeps_history(self):
+        from core import cards
+
+        c = cards.empty_card()
+        cards.apply_ops(c, [{"op": "add", "text": "喜欢蓝莓"}, {"op": "add", "text": "生日三月五号"}], 1.0)
+        self.assertEqual([f["text"] for f in cards.current_facts(c)], ["喜欢蓝莓", "生日三月五号"])
+        done = cards.apply_ops(c, [{"op": "update", "id": 1, "text": "喜欢草莓"}, {"op": "remove", "id": 2},
+                                   {"op": "update", "id": 9, "text": "越界"}, "垃圾", {"op": "add", "text": "喜欢草莓"}], 2.0)
+        self.assertEqual(done, {"add": 0, "update": 1, "remove": 1})  # 越界、重复、垃圾都忽略
+        self.assertEqual([f["text"] for f in cards.current_facts(c)], ["喜欢草莓"])
+        self.assertEqual({f["text"] for f in cards.past_facts(c)}, {"喜欢蓝莓", "生日三月五号"})
+        self.assertIn("（以前：", cards.render(c))
+
+    def test_caps_and_parse(self):
+        from core import cards
+
+        c = cards.empty_card()
+        cards.apply_ops(c, [{"op": "add", "text": f"事实{i}"} for i in range(20)], 1.0)
+        self.assertEqual(len(cards.current_facts(c)), cards.FACTS_CURRENT_MAX)
+        self.assertLessEqual(len(cards.render(c)), 160)
+        self.assertEqual(cards.parse_json('好的：\n```json\n{"profile": "p", "ops": []}\n```'), {"profile": "p", "ops": []})
+        self.assertIsNone(cards.parse_json("不是 JSON"))
+        self.assertIsNone(cards.parse_json('{"profile": '))
+
+    def make(self, d, card_reply='{"profile": "主人是上班族，最近在准备驾照考试", "ops": [{"op": "add", "text": "喜欢草莓"}]}'):
+        a = Agent(Settings(data_dir=Path(d), owners={"1"}, card_min_new=3), random.Random(0))
+        a.weather["海"] = {"temp": 24, "humidity": 70, "wind": 8, "cloud": 0.3, "precipitation": 0}
+        self.calls = {"chat": [], "card": []}
+
+        async def chat(messages, max_tokens, temperature):
+            self.calls["chat"].append(messages)
+            return "嗯嗯", 0, 0
+
+        async def card(messages, max_tokens, temperature):
+            self.calls["card"].append(messages)
+            if "最近的生活" in messages[0]["content"]:
+                return "你最近在阳台种花，常和小灰玩。", 0, 0
+            return card_reply, 0, 0
+
+        a.llm.backend = chat
+        a.card_backend = card
+        return a
+
+    def test_nightly_update_respects_threshold_and_uses_card_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d)
+            for t in ("我最喜欢的水果是草莓", "下周三考驾照", "今天加班到九点"):
+                a.bank.write("1", t, tags=["user:1"])
+            a.bank.write("2", "我喜欢猫", name="小红", tags=["user:2"])
+            for t in ("在书房读书", "给菜地浇水", "和小灰玩"):
+                a.bank.write(SELF, t, source="self")
+            r = asyncio.run(a.job_cards())
+            self.assertEqual(sorted(r["updated"]), ["1", "2"])  # 第一次整理只要 1 条新记忆
+            self.assertTrue(r["self"])
+            self.assertEqual(self.calls["chat"], [])  # 全走整理卡片的模型
+            self.assertIn("喜欢草莓", a.card_line("1"))
+            self.assertIn("阳台种花", a.card_line(SELF))
+            # 第二晚：主人只有 1 条新记忆，低于门槛 3，跳过
+            a.bank.write("1", "今天下雨了", tags=["user:1"])
+            r = asyncio.run(a.job_cards())
+            self.assertEqual(r["updated"], [])
+            # 手动 /整理卡片 不看门槛
+            r = asyncio.run(a.update_cards(keys=["1"], force=True))
+            self.assertEqual(r["updated"], ["1"])
+            self.assertIn("今天下雨了", self.calls["card"][-1][1]["content"])
+
+    def test_max_people_and_bad_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d, card_reply="我不会输出 JSON")
+            a.s.card_max_people = 1
+            for uid in ("2", "3"):
+                a.bank.write(uid, f"群友{uid}说了些话", tags=[f"user:{uid}"])
+            a.bank.write("3", "群友3又说了些话", tags=["user:3"])
+            r = asyncio.run(a.update_cards())
+            self.assertEqual(r["failed"], ["3"])  # 新记忆多的优先，坏 JSON 记为失败，卡片不变
+            self.assertEqual(r["skipped"], 1)
+            self.assertIsNone(a.card("3"))
+
+    def test_cards_in_prompt_and_privacy(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d)
+            a.social.touch("2", "小红")
+            a.bank.write("1", "我最喜欢的水果是草莓", tags=["user:1"])
+            a.bank.write("2", "我最近失恋了", name="小红", tags=["user:2"])
+            a.bank.meta["2"]["card"] = {"profile": "小红最近失恋了", "facts": [], "updated": 1.0}
+            for t in ("在书房读书", "给菜地浇水", "和小灰玩"):
+                a.bank.write(SELF, t, source="self")
+            asyncio.run(a.job_cards())
+
+            async def say(uid, nick, text, gid=None):
+                await a.on_message(Incoming(uid, nick, text, group_id=gid, is_tome=True))
+                return self.calls["chat"][-1]
+
+            owner = asyncio.run(say("1", "想睡觉", "今天好累"))
+            self.assertIn("【你对主人的印象】主人是上班族", owner[0]["content"])
+            self.assertIn("【你最近的生活】你最近在阳台种花", owner[0]["content"])
+            self.assertNotIn("失恋", owner[-1]["content"])
+            asked = asyncio.run(say("1", "想睡觉", "小红最近怎么样"))
+            self.assertIn("你对小红的印象：小红最近失恋了", asked[-1]["content"])  # 主人私聊问起可以看
+            group = asyncio.run(say("3", "阿杰", "小红最近怎么样", gid="g"))
+            self.assertNotIn("失恋", group[0]["content"] + group[-1]["content"])  # 群里不外传
+            red_group = asyncio.run(say("2", "小红", "大肥鱼你好呀", gid="g"))
+            self.assertIn("你对TA的印象：小红最近失恋了", red_group[-1]["content"])
+            self.assertNotIn("失恋", red_group[0]["content"])  # 群聊 system 不随说话人变
+            # 卡片持久化
+            a.save()
+            b = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            b.load()
+            self.assertEqual(b.card_line("1"), a.card_line("1"))
+            self.assertEqual(b.card_line(SELF), a.card_line(SELF))
+            self.assertIn("对主人的印象", b.card_text("1"))
+
+
 class TestHostHooks(unittest.TestCase):
     def test_llm_backend_and_cost(self):
         from core.llm import LLM
@@ -557,6 +673,50 @@ class TestHostHooks(unittest.TestCase):
         out = asyncio.run(llm.chat([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]))
         self.assertEqual(out, "好呀")
         self.assertAlmostEqual(llm.daily_burn(), 0.002 + 0.004)
+
+    def test_cache_hit_pricing(self):
+        from core.llm import LLM
+
+        async def backend(messages, max_tokens, temperature):
+            return "好", 1000, 500, 800  # 1000 输入里 800 命中缓存
+
+        llm = LLM("", "", "", price_in=0.002, price_out=0.008, backend=backend, price_in_hit=0.0005)
+        asyncio.run(llm.chat([{"role": "user", "content": "u"}]))
+        # 200 未命中 × 0.002 + 800 命中 × 0.0005 + 500 输出 × 0.008（每千 token）
+        self.assertAlmostEqual(llm.daily_burn(), 0.0004 + 0.0004 + 0.004)
+        report = llm.report()
+        self.assertIn("命中缓存 800", report)
+        self.assertIn("缓存命中率：今日 80%", report)
+        self.assertIn("省下约 ¥0.0012", report)  # 800 × (0.002 − 0.0005) / 1000
+
+    def test_usage_parsing(self):
+        from core.llm import usage_from_openai
+
+        self.assertEqual(usage_from_openai({"prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 80}), (100, 5, 80))
+        self.assertEqual(
+            usage_from_openai({"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 64}}),
+            (100, 5, 64),
+        )
+        self.assertEqual(usage_from_openai({"prompt_tokens": 10, "completion_tokens": 1}), (10, 1, 0))
+        self.assertEqual(usage_from_openai(None), (0, 0, 0))
+
+    def test_status_line_is_a_short_phrase(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Agent(Settings(data_dir=Path(d)), random.Random(0))
+            a.weather["海"] = {"temp": 24, "humidity": 70, "wind": 8, "cloud": 0.3, "precipitation": 0}
+            calm = a.status_line("你好")
+            self.assertNotIn("驱力", calm)
+            self.assertNotIn("湿度", calm)
+            self.assertNotIn("金币", calm)
+            self.assertNotIn("小灰", calm)
+            self.assertLess(len(calm), 30)
+            a.drives.value.update(rest=90, social=80, play=75)
+            a.body["hunger"] = 80
+            busy = a.status_line("你好")
+            self.assertIn("有点困，有点想找人说话，有点饿", busy)  # 最多两个驱力，按强弱
+            self.assertNotIn("想出去玩", busy)
+            self.assertIn("小灰在", a.status_line("小灰今天乖吗"))
+            self.assertIn("金币", a.status_line("你钱够花吗"))
 
     def test_embed_provider_fallback(self):
         from core.embedding import HASH_BACKEND, Embedder

@@ -16,8 +16,9 @@ from .core.world import ROOMS
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu"
 LOOP_SECONDS = 30
-# 每日任务：(名称, 时, 分)
+# 每日任务：(名称, 时, 分)；整理印象卡的时间可在配置里改
 DAILY = (("consolidate", 3, 0), ("diary", 22, 30))
+CARD_TIME_DEFAULT = (3, 30)
 CHORES = {"浇水": "浇水", "收菜": "收菜", "种地": "种地", "打扫": "家务", "喂猫": "喂猫", "剪花": "剪花", "拾荒": "拾荒"}
 
 
@@ -28,6 +29,7 @@ class DaFeiYu(Star):
     /状态 /岛 /房间 /农场 /日记 /商店 /关系
     主人：/记忆 [关键词] /记住 内容 /购买 物品 [数量] /浇水 /收菜 /种地 [作物] /打扫 /喂猫 /剪花 /拾荒
           /门 房间A 房间B open|closed|locked /禁忌 QQ号 话题 /自检 /成本 /余额 数值 /巩固
+          /印象 [QQ号] /整理卡片 [QQ号]
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -56,15 +58,24 @@ class DaFeiYu(Star):
             llm_base_url=config.get("llm_base_url", "https://api.deepseek.com"),
             llm_model=config.get("llm_model", "deepseek-chat"),
             price_in=float(config.get("price_in", 0.002)),
+            price_in_hit=float(config.get("price_in_hit", 0.0005)),
             price_out=float(config.get("price_out", 0.008)),
             hot_capacity=int(config.get("hot_capacity", 5000)),
             tz=config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai",
+            card_enabled=bool(config.get("card_enabled", True)),
+            card_min_new=int(config.get("card_min_new", 3)),
+            card_max_people=int(config.get("card_max_people", 30)),
         )
         if config.get("persona"):
             settings.persona = config["persona"]
         self.agent = Agent(settings)
         if not custom_llm:
             self.agent.llm.backend = self._provider_chat
+        if config.get("card_provider_id"):
+            self.agent.card_backend = self._card_backend(config["card_provider_id"])
+        self.daily = list(DAILY)
+        if settings.card_enabled:
+            self.daily.append(("cards", *self._parse_time(config.get("card_time", ""), CARD_TIME_DEFAULT)))
         if config.get("embedding_provider_id"):
             self.agent.embedder.provider = self._provider_embed
             self.agent.embedder.provider_name = config["embedding_provider_id"]
@@ -90,8 +101,19 @@ class DaFeiYu(Star):
         self.agent.save()
 
     # ================================================================ 模型接入
-    async def _chat_provider(self):
-        pid = self.config.get("llm_provider_id", "")
+    @staticmethod
+    def _parse_time(text: str, default: tuple[int, int]) -> tuple[int, int]:
+        """"03:30" → (3, 30)；格式不对用默认值。"""
+        try:
+            h, m = (int(x) for x in str(text).strip().split(":"))
+            if 0 <= h < 24 and 0 <= m < 60:
+                return h, m
+        except ValueError:
+            pass
+        return default
+
+    async def _chat_provider(self, pid: str = ""):
+        pid = pid or self.config.get("llm_provider_id", "")
         prov = self.context.get_provider_by_id(pid) if pid else None
         if prov is None or not hasattr(prov, "text_chat"):
             prov = await self.context.get_using_provider_async()
@@ -99,16 +121,32 @@ class DaFeiYu(Star):
             raise RuntimeError("AstrBot 里没有可用的对话模型提供商")
         return prov
 
-    async def _provider_chat(self, messages: list[dict], max_tokens: int, temperature: float):
+    def _card_backend(self, pid: str):
+        """整理印象卡专用的提供商（可以选更便宜的模型）。"""
+
+        async def chat(messages: list[dict], max_tokens: int, temperature: float):
+            return await self._provider_chat(messages, max_tokens, temperature, pid=pid)
+
+        return chat
+
+    async def _provider_chat(self, messages: list[dict], max_tokens: int, temperature: float, pid: str = ""):
         """用 AstrBot 面板里配好的提供商（例如 DeepSeek）对话。"""
-        prov = await self._chat_provider()
+        prov = await self._chat_provider(pid)
         system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         rest = [m for m in messages if m["role"] != "system"]
         prompt = rest[-1]["content"] if rest and rest[-1]["role"] == "user" else None
         contexts = rest[:-1] if prompt is not None else rest
         resp = await prov.text_chat(prompt=prompt, contexts=contexts, system_prompt=system or None)
         usage = getattr(resp, "usage", None)
-        return resp.completion_text, (usage.input if usage else 0), (usage.output if usage else 0)
+        if not usage:
+            return resp.completion_text, 0, 0, 0
+        # AstrBot 的 TokenUsage：input = 未命中(input_other) + 命中(input_cached)。
+        # AstrBot 只认 OpenAI 风格的 cached_tokens；DeepSeek 自有字段是 prompt_cache_hit_tokens，取不到时从原始响应补
+        hit = getattr(usage, "input_cached", 0) or 0
+        if not hit:
+            raw = getattr(getattr(resp, "raw_completion", None), "usage", None)
+            hit = getattr(raw, "prompt_cache_hit_tokens", 0) or 0
+        return resp.completion_text, usage.input, usage.output, min(int(hit), usage.input)
 
     async def _provider_embed(self, texts: list[str]) -> list[list[float]]:
         prov = self.context.get_provider_by_id(self.config["embedding_provider_id"])
@@ -126,9 +164,23 @@ class DaFeiYu(Star):
             "maintain": self._job_maintain,
             "consolidate": self._job_consolidate,
             "diary": a.job_diary,
+            "cards": self._job_cards,
             "selftest": self._job_selftest,
             "save": self._job_save,
         }
+
+    async def _job_cards(self) -> None:
+        logger.info(f"整理印象卡：{self._cards_report(await self.agent.job_cards())}")
+
+    def _cards_report(self, r: dict) -> str:
+        if r.get("error"):
+            return r["error"]
+        names = lambda keys: "、".join(self.agent._whose(k) for k in keys) or "无"  # noqa: E731
+        return (
+            f"更新 {len(r['updated'])} 人（{names(r['updated'])}）；失败 {len(r['failed'])} 人"
+            f"{'（' + names(r['failed']) + '）' if r['failed'] else ''}；跳过 {r['skipped']} 人；"
+            f"她自己的近况{'已更新' if r['self'] else '未更新'}"
+        )
 
     async def _job_tick(self) -> None:
         for uid, text in await self.agent.job_tick():
@@ -168,7 +220,7 @@ class DaFeiYu(Star):
                         await self._run(name)
                 local = self.agent._dt()
                 done = self.agent.host.setdefault("daily", {})
-                for name, h, m in DAILY:
+                for name, h, m in self.daily:
                     if (local.hour, local.minute) >= (h, m) and done.get(name) != local.strftime("%Y-%m-%d"):
                         done[name] = local.strftime("%Y-%m-%d")
                         await self._run(name)
@@ -441,4 +493,26 @@ class DaFeiYu(Star):
             return
         r = await self.agent.job_consolidate()
         yield event.plain_result(f"重放{r['replay']} 合并{r['merge']} 抽象{r['abstract']} 剪边{r['prune']} 下沉{r['forget']}")
+
+    @filter.command("整理卡片")
+    async def cmd_update_cards(self, event: AstrMessageEvent):
+        """立刻调用模型整理印象卡：不带参数整理所有有新记忆的人和她自己，带 QQ 号只整理那个人。"""
+        if not self._owner(event):
+            yield event.plain_result("这个只有主人能用哦")
+            return
+        args = self._args(event)
+        yield event.plain_result("开始整理印象卡……")
+        r = await self.agent.update_cards(keys=args or None, force=True)
+        yield event.plain_result(self._cards_report(r))
+
+    @filter.command("印象")
+    async def cmd_card(self, event: AstrMessageEvent):
+        """看她对某人的印象卡。主人可以看任何人和她自己（/印象 self），其他人只能看对自己的。"""
+        args = self._args(event)
+        me = str(event.get_sender_id())
+        key = args[0] if args else me
+        if key != me and not self._owner(event):
+            yield event.plain_result("只能看她对你自己的印象哦")
+            return
+        yield event.plain_result(self.agent.card_text(key))
 
