@@ -192,14 +192,20 @@ class MemoryBank:
                 merged.append(BankHit(key, h, round(h.score * w, 4)))
         merged.sort(key=lambda b: b.score, reverse=True)
         chosen = merged[:k]
-        if update and chosen:
-            t = now()
-            by_key: dict[str, list[str]] = {}
-            for b in chosen:
-                by_key.setdefault(b.key, []).append(b.node["id"])
-            for key, ids in by_key.items():
-                self.stores[key]._after_recall(ids, t)
+        if update:
+            self.reinforce(chosen)
         return chosen
+
+    def reinforce(self, hits: list[BankHit]) -> None:
+        """检索即强化：只对最终真正用上的记忆做。"""
+        if not hits:
+            return
+        t = now()
+        by_key: dict[str, list[str]] = {}
+        for b in hits:
+            by_key.setdefault(b.key, []).append(b.node["id"])
+        for key, ids in by_key.items():
+            self.stores[key]._after_recall(ids, t)
 
     # ------------------------------------------------------------------ 持久化
     def save(self, directory: Path) -> None:

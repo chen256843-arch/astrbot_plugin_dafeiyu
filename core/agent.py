@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
@@ -22,7 +23,7 @@ from .bank import SELF, BankHit, MemoryBank, time_label
 from .llm import LLM
 from .memory import REGIONS, affect
 from .social import BOUNDARY, Social
-from .util import DAY, HOUR, atomic_write_json, now, read_json
+from .util import DAY, HOUR, atomic_write_json, char_set, jaccard, normalize, now, read_json
 from .world import LANDMARKS, World
 
 log = logging.getLogger("dafeiyu.agent")
@@ -40,6 +41,25 @@ JOB_INTERVALS = {
     "selftest": 6 * HOUR,
     "save": 300,
 }
+
+# 对话历史：超过 HIST_MAX 条时一次性压缩到 HIST_KEEP 条，更早的进前情提要
+HIST_MAX = 20
+HIST_KEEP = 8
+SUMMARY_MAX = 80
+# 按需检索：低于 max(绝对下限, 首条分数 × 相对比例) 的记忆不放进提示词
+RECALL_FLOOR = 0.12
+RECALL_RELATIVE = 0.35
+SMALL_TALK = {
+    "嗯", "嗯嗯", "嗯呢", "哦", "哦哦", "噢", "啊", "好", "好的", "好滴", "好哒", "行", "可以", "ok", "okk", "收到",
+    "哈", "哈哈", "哈哈哈", "哈哈哈哈", "嘿嘿", "嘻嘻", "呵呵", "666", "6", "早", "早安", "晚安", "拜拜", "在", "在吗",
+    "谢谢", "谢啦", "对", "对的", "是的", "没事", "嗷", "呜呜",
+}
+
+
+def is_small_talk(text: str) -> bool:
+    """寒暄、语气词、纯表情：不查记忆，不带〈此刻〉。"""
+    t = normalize(text)
+    return not t or t in SMALL_TALK
 
 
 @dataclass
@@ -105,7 +125,10 @@ class Agent:
         self.last_tick = now()
         self.last_owner_msg = 0.0
         self.last_proactive = 0.0
-        self.history: dict[str, list[dict]] = {}
+        self.history: dict[str, list[dict]] = {}  # 会话 → 最近的原话（只追加，分批截断）
+        self.summaries: dict[str, str] = {}  # 会话 → 更早对话的前情提要
+        self._compressing: set[str] = set()
+        self._bg: set[asyncio.Task] = set()
 
     # ================================================================ 持久化
     @property
@@ -147,6 +170,8 @@ class Agent:
         self.last_owner_msg = st.get("last_owner_msg", 0.0)
         self.last_proactive = st.get("last_proactive", 0.0)
         self.host = st.get("host", {})
+        self.history = st.get("history", {})
+        self.summaries = st.get("summaries", {})
 
     def save(self) -> None:
         sp, bank_dir, _ = self._paths
@@ -170,6 +195,8 @@ class Agent:
                 "last_owner_msg": self.last_owner_msg,
                 "last_proactive": self.last_proactive,
                 "host": self.host,
+                "history": self.history,
+                "summaries": self.summaries,
             },
         )
         self.bank.save(bank_dir)
@@ -597,38 +624,120 @@ class Agent:
             self._event("主人吃完饭了，可她还没做饭")
 
     async def _reply(self, msg: Incoming, is_owner: bool) -> str:
+        """组装请求时按「不变的在前、每轮变的在后」排，好让 DeepSeek 的前缀缓存命中：
+
+        [system：人设 + 说话方式 + 对方/场景 + 前情提要] → [历史，只追加] → [〈此刻〉状态与想起的事 + 这句话]
+        """
         uid = str(msg.uid)
+        key = f"g:{msg.group_id}" if msg.group_id else f"p:{uid}"
+        hist = self.history.setdefault(key, [])
+        user_line = msg.text if not msg.group_id else f"{msg.nick or '一位群友'}：{msg.text}"
+        light = is_small_talk(msg.text)
+        hits = [] if light else await self._recall(msg, uid, hist)
+
+        reply = None
+        if self.llm.enabled:
+            content = user_line if light else f"{self._context_block(uid, msg, hits)}\n{user_line}"
+            messages = [
+                {"role": "system", "content": self._system_prompt(uid, msg, key)},
+                *hist,
+                {"role": "user", "content": content},
+            ]
+            reply = await self.llm.chat(messages)
+            if reply:
+                self.llm.llm_actions += 1
+        if not reply:
+            reply = self._template_reply(msg.text, hits)
+        # 历史里只存原话，不存〈此刻〉，下一轮它就是可缓存的前缀
+        hist.extend([{"role": "user", "content": user_line}, {"role": "assistant", "content": reply}])
+        self._maybe_compress(key)
+        return reply
+
+    async def _recall(self, msg: Incoming, uid: str, hist: list[dict]) -> list[BankHit]:
+        """按需检索：只留明显相关的，去掉最近对话里已经说过的，再对用上的做检索强化。"""
         _, vecs = await self.embedder.embed([msg.text])
-        temp_label, temp = self.drives.recall_temperature(self.rng)
+        _, temp = self.drives.recall_temperature(self.rng)
         weights = self.bank.route(msg.text, uid, self._aliases())
         hits = self.bank.retrieve(
             msg.text,
             weights,
             k=6,
             visible=lambda key, node: self._visible(key, node, uid, msg.group_id),
+            update=False,
             query_vec=vecs[0] if vecs else None,
             backend=self.embedder.backend,
             drive_bias=self.drives.drive_bias,
             mood=self.drives.mood,
             temperature=temp,
         )
+        if hits:
+            floor = max(RECALL_FLOOR, RECALL_RELATIVE * hits[0].score)
+            recent = [char_set(m["content"]) for m in hist] + [char_set(msg.text)]
+            hits = [
+                h for h in hits
+                if h.score >= floor and not any(jaccard(char_set(h.node["text"]), r) >= 0.8 for r in recent)
+            ]
+        self.bank.reinforce(hits)
+        return hits
 
-        key = f"g:{msg.group_id}" if msg.group_id else f"p:{uid}"
-        hist = self.history.setdefault(key, [])
-        speaker = msg.nick or uid
-        user_line = msg.text if not msg.group_id else f"{speaker}：{msg.text}"
+    # ---------------------------------------------------------------- 短期记忆
+    def _maybe_compress(self, key: str) -> None:
+        """历史超过 HIST_MAX 条时，把较早的部分压成前情提要，只留最近 HIST_KEEP 条。
 
-        reply = None
+        一次性截一大段而不是每轮丢一条：两次截断之间历史只追加，前缀保持不变，缓存一直能命中。
+        """
+        hist = self.history[key]
+        if len(hist) <= HIST_MAX or key in self._compressing:
+            return
+        n = len(hist) - HIST_KEEP
+        old = hist[:n]
         if self.llm.enabled:
-            messages = [{"role": "system", "content": self._system_prompt(uid, msg, hits)}, *hist[-10:], {"role": "user", "content": user_line}]
-            reply = await self.llm.chat(messages)
-            if reply:
-                self.llm.llm_actions += 1
-        if not reply:
-            reply = self._template_reply(msg.text, hits)
-        hist.extend([{"role": "user", "content": user_line}, {"role": "assistant", "content": reply}])
-        del hist[:-20]
-        return reply
+            self._compressing.add(key)
+            self._spawn(self._compress(key, n, old))  # 后台做，不拖慢这次回复
+        else:
+            self._apply_summary(key, n, self._template_summary(key, old))
+
+    async def _compress(self, key: str, n: int, old: list[dict]) -> None:
+        try:
+            prev = self.summaries.get(key, "")
+            group = key.startswith("g:")
+            lines = "\n".join(
+                f"你：{m['content']}" if m["role"] == "assistant" else (m["content"] if group else f"对方：{m['content']}")
+                for m in old
+            )
+            summary = await self.llm.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": f"把下面的聊天压缩成一段 {SUMMARY_MAX} 字以内的前情提要，保留人名、事实、约定和情绪，只输出这段话。",
+                    },
+                    {"role": "user", "content": (f"已有的前情提要：{prev}\n" if prev else "") + f"新的对话：\n{lines}"},
+                ],
+                max_tokens=160,
+                temperature=0.3,
+            )
+            self._apply_summary(key, n, summary or self._template_summary(key, old))
+        finally:
+            self._compressing.discard(key)
+
+    def _template_summary(self, key: str, old: list[dict]) -> str:
+        said = "；".join(m["content"][:12] for m in old if m["role"] == "user")
+        prev = self.summaries.get(key, "")
+        return ((prev + "；") if prev else "之前聊到：") + said
+
+    def _apply_summary(self, key: str, n: int, summary: str) -> None:
+        self.summaries[key] = summary.strip()[-SUMMARY_MAX * 2 :]
+        del self.history[key][:n]  # 期间新追加的消息在末尾，不受影响
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def flush_background(self) -> None:
+        """等后台任务（前情提要）做完。测试和关闭时用。"""
+        while self._bg:
+            await asyncio.gather(*list(self._bg), return_exceptions=True)
 
     def _visible(self, key: str, node: dict, uid: str, group_id: str | None) -> bool:
         """这条记忆此刻能不能用。
@@ -685,25 +794,47 @@ class Agent:
             parts.append(f"〔{self.memory_header(key, uid)}〕\n" + "\n".join(lines))
         return "\n".join(parts)
 
-    def _system_prompt(self, uid: str, msg: Incoming, hits) -> str:
+    def _relation_line(self, uid: str, msg: Incoming) -> str:
         tier = self.social.tier(uid)
-        rel = self.social.rel.get(uid, {})
+        taboos = "、".join(self.social.rel.get(uid, {}).get("taboos", [])) or "无"
+        who = "主人" if self.social.is_owner(uid) else msg.nick or "对方"
+        return f"{who}，关系：{tier}。相处边界：{BOUNDARY[tier]}。禁忌话题：{taboos}"
+
+    def _system_prompt(self, uid: str, msg: Incoming, key: str | None = None) -> str:
+        """不随轮次变化的部分：人设、说话方式、私聊对象（群聊里对象每条都不同，放到〈此刻〉）、前情提要。"""
+        persona = self.s.group_persona if (msg.group_id and self.s.group_persona) else self.s.persona
+        parts = [
+            f"你是「{self.s.name}」。{persona}",
+            "【说话方式】像发 QQ 消息一样口语化，一般 1–3 句，不用 markdown 和列表。"
+            "对方消息前的〈此刻〉…〈/此刻〉是你此刻的状态和想起的事，只作参考，不要复述，也不要提到这些标签。"
+            "只根据想起的记忆谈过去的事，记不清就直说。提到记忆时分清是谁说的，不要张冠李戴。"
+            "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。",
+        ]
+        if msg.group_id:
+            parts.append("【场景】群聊，有多位群友，每条消息前标了说话人的昵称。")
+        else:
+            parts.append(f"【对方】{self._relation_line(uid, msg)}")
+        summary = self.summaries.get(key or "", "")
+        if summary:
+            parts.append(f"【前情提要】{summary}")
+        return "\n".join(parts)
+
+    def _context_block(self, uid: str, msg: Incoming, hits: list[BankHit]) -> str:
+        """每轮都变的部分，附在这句话前面（在请求的最末尾，不影响前面的缓存）。"""
         w = self._home_weather()
         cat = self.world.agents["小灰"]
-        mem_lines = self.memory_block(hits, uid)
-        taboos = "、".join(rel.get("taboos", [])) or "无"
-        where = "群聊" if msg.group_id else "私聊"
-        persona = self.s.group_persona if (msg.group_id and self.s.group_persona) else self.s.persona
-        return (
-            f"你是「{self.s.name}」。{persona}\n"
-            f"【此刻】{self._dt().strftime('%H:%M')}，{weather.describe(w)}。你在{self.location_text()}，正在{self.activity['name']}。"
-            f"心情{self.mood_word()}。驱力：{self.drives.summary()}。小灰{cat['mode']}中。金币 {self.econ.coins}。\n"
-            f"【对方】{msg.nick or uid}（{where}），关系：{tier}。相处边界：{BOUNDARY[tier]}。禁忌话题：{taboos}\n"
-            f"【想起的记忆】按人分组，每条前面是大概时间：\n{mem_lines}\n"
-            "【说话方式】像发 QQ 消息一样口语化，一般 1–3 句，不用 markdown 和列表。只根据上面的记忆谈过去的事，记不清就直说。"
-            "提到记忆时分清是谁说的：别人说的事不要说成是对方说的，也不要把对方说过的话安到别人头上。"
-            "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。"
-        )
+        lines = [
+            "〈此刻〉",
+            f"{self._dt().strftime('%H:%M')}，{weather.describe(w)}。你在{self.location_text()}，正在{self.activity['name']}。"
+            f"心情{self.mood_word()}。驱力：{self.drives.summary()}。小灰{cat['mode']}中。金币 {self.econ.coins}。",
+        ]
+        if msg.group_id:
+            lines.append(f"说话的是{self._relation_line(uid, msg)}")
+        if hits:
+            lines.append("想起的事（按人分组，前面是大概时间）：")
+            lines.append(self.memory_block(hits, uid))
+        lines.append("〈/此刻〉")
+        return "\n".join(lines)
 
     def _template_reply(self, text: str, hits) -> str:
         base = f"我在{self.location_text()}{self.activity['name']}呢"

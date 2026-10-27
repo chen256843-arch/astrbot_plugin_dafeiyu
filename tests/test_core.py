@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import gua, sun  # noqa: E402
-from core.agent import Agent, Incoming, Settings  # noqa: E402
+from core.agent import HIST_KEEP, HIST_MAX, Agent, Incoming, Settings  # noqa: E402
 from core.bank import SELF, BankHit, MemoryBank, time_label  # noqa: E402
 from core.collapse import born, collapse  # noqa: E402
 from core.drives import Drives  # noqa: E402
@@ -415,6 +415,131 @@ class TestMemoryBank(unittest.TestCase):
             text = a.memory_text("草莓", "1")
             self.assertIn("主人(1)·m", text)
             self.assertIn("刚才：我最喜欢的水果是草莓", text)
+
+
+class TestPromptCache(unittest.TestCase):
+    """提示词按「不变在前、变的在后」排列，历史分批截断，按需检索。"""
+
+    def agent(self, d, with_llm=True):
+        a = Agent(Settings(data_dir=Path(d), owners={"1"}, persona="人设" * 50), random.Random(0))
+        a.weather["海"] = {"temp": 24, "humidity": 70, "wind": 8, "cloud": 0.3, "precipitation": 0}
+        self.calls = []
+
+        async def backend(messages, max_tokens, temperature):
+            self.calls.append(messages)
+            if not messages[0]["content"].startswith("你是"):
+                return "前情：聊了工作和水果", 0, 0
+            return f"回复{len(self.calls)}", 0, 0
+
+        if with_llm:
+            a.llm.backend = backend
+        return a
+
+    def chat_calls(self):
+        return [m for m in self.calls if m[0]["content"].startswith("你是")]
+
+    def test_system_prompt_is_stable(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d)
+            msg = Incoming("1", "想睡觉", "你好")
+            first = a._system_prompt("1", msg, "p:1")
+            a.drives.bump("play", 50)
+            a.econ.earn(30, "测试")
+            a.activity["name"] = "读书"
+            self.assertEqual(a._system_prompt("1", msg, "p:1"), first)
+            self.assertNotIn("〈此刻〉", first.split("【说话方式】")[0])
+            self.assertNotRegex(first, r"\d\d:\d\d")
+
+    def test_prefix_grows_append_only_between_trims(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d)
+
+            async def run():
+                for i in range(14):
+                    await a.on_message(Incoming("1", "想睡觉", f"第{i}件事：今天发生了一件很特别的事情编号{i}"))
+                    await a.flush_background()
+
+            asyncio.run(run())
+            calls = self.chat_calls()
+            breaks = 0
+            for prev, cur in zip(calls, calls[1:]):
+                if cur[: len(prev) - 1] != prev[:-1]:  # 上一轮除最后一条外，必须原样是这一轮的前缀
+                    breaks += 1
+            self.assertEqual(breaks, 1)  # 只有压缩那一次换了前缀
+            self.assertTrue(a.summaries["p:1"].startswith("前情"))
+            self.assertLessEqual(len(a.history["p:1"]), HIST_MAX)
+            self.assertIn("【前情提要】前情", calls[-1][0]["content"])
+            # 历史里只存原话，不存〈此刻〉
+            self.assertFalse(any("〈此刻〉" in m["content"] for m in a.history["p:1"]))
+            self.assertIn("〈此刻〉", calls[-1][-1]["content"])
+
+    def test_trim_without_llm_uses_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d, with_llm=False)
+
+            async def run():
+                for i in range(11):
+                    await a.on_message(Incoming("1", "想睡觉", f"第{i}件很特别的事情"))
+
+            asyncio.run(run())
+            self.assertEqual(len(a.history["p:1"]), HIST_KEEP)  # 第 11 轮到 22 条，超过 20，一次截到 8 条
+            self.assertTrue(a.summaries["p:1"].startswith("之前聊到：第0件"))
+
+    def test_small_talk_skips_recall_and_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d)
+            a.bank.write("1", "我最喜欢的水果是草莓", tags=["user:1"])
+
+            async def run():
+                await a.on_message(Incoming("1", "想睡觉", "哈哈哈"))
+                await a.on_message(Incoming("1", "想睡觉", "👌"))
+                await a.on_message(Incoming("1", "想睡觉", "你还记得我喜欢什么水果吗"))
+
+            asyncio.run(run())
+            calls = self.chat_calls()
+            self.assertEqual(calls[0][-1]["content"], "哈哈哈")
+            self.assertEqual(calls[1][-1]["content"], "👌")
+            self.assertIn("想起的事", calls[2][-1]["content"])
+            self.assertIn("草莓", calls[2][-1]["content"])
+
+    def test_recall_drops_what_was_just_said_and_weak_hits(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d)
+            a.bank.write("1", "我下周三要去考驾照科目二", tags=["user:1"])
+            weak = a.bank.write("1", "楼下便利店的关东煮还挺好吃", tags=["user:1"])
+            hist = [{"role": "user", "content": "我下周三要去考驾照科目二"}]
+
+            hits = asyncio.run(a._recall(Incoming("1", "x", "考驾照要注意什么"), "1", hist))
+            self.assertEqual(hits, [])  # 刚说过的不重复放
+            hits = asyncio.run(a._recall(Incoming("1", "x", "考驾照要注意什么"), "1", []))
+            self.assertEqual([h.node["text"] for h in hits], ["我下周三要去考驾照科目二"])
+            self.assertEqual(weak["hits"], 0)  # 没用上的不做检索强化
+
+    def test_group_prompt_does_not_change_with_speaker(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d)
+
+            async def run():
+                await a.on_message(Incoming("2", "小红", "大肥鱼你家猫叫什么", group_id="g", is_tome=True))
+                await a.on_message(Incoming("3", "阿杰", "大肥鱼今天天气怎么样", group_id="g", is_tome=True))
+
+            asyncio.run(run())
+            c1, c2 = self.chat_calls()
+            self.assertEqual(c1[0], c2[0])  # system 相同
+            self.assertNotIn("小红", c1[0]["content"])
+            self.assertIn("说话的是阿杰", c2[-1]["content"])
+            self.assertEqual(c2[1]["content"], "小红：大肥鱼你家猫叫什么")
+
+    def test_history_and_summary_persist(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.agent(d, with_llm=False)
+            asyncio.run(a.on_message(Incoming("1", "想睡觉", "今天去了海边")))
+            a.summaries["p:1"] = "之前聊到：工作"
+            a.save()
+            b = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            b.load()
+            self.assertEqual(b.history, a.history)
+            self.assertEqual(b.summaries, {"p:1": "之前聊到：工作"})
 
 
 class TestHostHooks(unittest.TestCase):
