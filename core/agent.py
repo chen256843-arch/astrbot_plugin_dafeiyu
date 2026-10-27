@@ -20,7 +20,7 @@ from .ecology import CROPS, Ecology
 from .economy import INCOME, Economy
 from .embedding import Embedder
 from .bank import SELF, BankHit, MemoryBank, time_label
-from .llm import LLM
+from .llm import LLM, Backend
 from .memory import REGIONS, affect
 from .social import BOUNDARY, Social
 from .util import DAY, HOUR, atomic_write_json, char_set, jaccard, normalize, now, read_json
@@ -126,6 +126,7 @@ class Incoming:
     text: str
     group_id: str | None = None
     is_tome: bool = False
+    backend: Backend | None = None  # 这一轮回复专用的后端（例如带上宿主框架的工具），空则用默认
 
 
 class Agent:
@@ -954,7 +955,7 @@ class Agent:
                 *hist,
                 {"role": "user", "content": content},
             ]
-            reply = await self.llm.chat(messages)
+            reply = await self.llm.chat(messages, backend=msg.backend)
             if reply:
                 self.llm.llm_actions += 1
         if not reply:

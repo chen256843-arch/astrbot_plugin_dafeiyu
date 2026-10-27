@@ -3,7 +3,7 @@ display_name: 大肥鱼
 desc: 带记忆闭环（编码/存储/巩固/检索/遗忘）、驱力与玻恩规则决策、浮空岛具身环境、生态经济与社交关系的长期陪伴角色。
 short_desc: 会记事、有作息、住在浮空小岛上的长期陪伴角色。
 author: chen256843
-version: 0.8.0
+version: 0.8.1
 repo: https://github.com/chen256843-arch/astrbot_plugin_dafeiyu
 support_platforms:
   - aiocqhttp

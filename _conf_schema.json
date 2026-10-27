@@ -185,6 +185,12 @@
     "_special": "select_provider",
     "hint": "选你在 AstrBot 里配置好的 DeepSeek。留空则跟随当前默认提供商。"
   },
+  "astrbot_tools": {
+    "description": "使用 AstrBot 的工具（联网搜索等）",
+    "type": "bool",
+    "default": true,
+    "hint": "回复时带上 AstrBot 里开启的联网搜索、MCP 和其他插件的函数工具，由模型自己决定要不要用（例如问到最新消息时去搜）。工具说明会占一些提示词 token。只在「对话模型来源」选 astrbot 时生效。"
+  },
   "llm_api_key": {
     "description": "自定义模式：API Key",
     "type": "string",

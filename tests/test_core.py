@@ -833,6 +833,34 @@ class TestHumanLikeMemory(unittest.TestCase):
 
 
 class TestHostHooks(unittest.TestCase):
+    def test_per_message_backend(self):
+        """宿主可以给某条消息换个回复后端（例如带上联网搜索工具）；只用于回复，历史里仍只存原话。"""
+        from core.llm import today
+
+        with tempfile.TemporaryDirectory() as d:
+            a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            used = []
+
+            async def default(messages, max_tokens, temperature):
+                used.append("default")
+                return "默认", 0, 0
+
+            async def with_tools(messages, max_tokens, temperature):
+                used.append("tools")
+                return "查到了，今天的新闻是这些", 100, 20, 60
+
+            a.llm.backend = default
+            reply = asyncio.run(a.on_message(Incoming("1", "主人", "今天有什么新闻", backend=with_tools)))
+            self.assertEqual(reply, "查到了，今天的新闻是这些")
+            self.assertEqual(used, ["tools"])
+            self.assertEqual(a.history["p:1"][-2:], [
+                {"role": "user", "content": "今天有什么新闻"},
+                {"role": "assistant", "content": "查到了，今天的新闻是这些"},
+            ])
+            self.assertEqual(a.llm.usage[today()]["hit"], 60)  # 用量照样记账
+            asyncio.run(a.on_message(Incoming("1", "主人", "好的")))
+            self.assertEqual(used, ["tools", "default"])
+
     def test_llm_backend_and_cost(self):
         from core.llm import LLM
 
