@@ -6,13 +6,13 @@ import random
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import gua, sun  # noqa: E402
-from core.agent import HIST_KEEP, HIST_MAX, Agent, Incoming, Settings  # noqa: E402
+from core.agent import HIST_KEEP, HIST_MAX, REFLECT_THRESHOLD, Agent, Incoming, Settings  # noqa: E402
 from core.bank import SELF, BankHit, MemoryBank, time_label  # noqa: E402
 from core.collapse import born, collapse  # noqa: E402
 from core.drives import Drives  # noqa: E402
@@ -21,6 +21,7 @@ from core.economy import Economy  # noqa: E402
 from core.embedding import hash_embed  # noqa: E402
 from core.memory import DAY, Hit, MemoryStore  # noqa: E402
 from core.social import Social  # noqa: E402
+from core.util import now  # noqa: E402
 from core.world import World  # noqa: E402
 
 
@@ -93,6 +94,39 @@ class TestMemory(unittest.TestCase):
         n = self.m.write("今天在书房看书", source="other", tier="normal")
         t = n["last_access"] + 7 * DAY
         self.assertAlmostEqual(self.m.weight(n, t), n["w0"] * math.exp(-1), places=5)
+
+    def test_spacing_effect(self):
+        """间隔着想起，稳定度大涨；一小时内想五次，几乎不涨。"""
+        hour = DAY / 24
+        spaced = self.m.write("主人最喜欢的水果是草莓", tier="normal")
+        self.assertEqual(self.m.stability(spaced), 7.0)  # 起点就是原来的 τ
+        for gap_days, want in ((5, 12.36), (12, 23.88), (21, 44.84)):
+            spaced["last_access"] -= gap_days * DAY
+            self.m._after_recall([spaced["id"]], now())
+            self.assertAlmostEqual(spaced["stability"], want, delta=0.05)
+        massed = self.m.write("主人说下周想去海边看日出", tier="normal")
+        for _ in range(5):
+            massed["last_access"] -= hour
+            self.m._after_recall([massed["id"]], now())
+        self.assertLess(self.m.stability(massed), 7.3)  # 第 4、5 次还撞上反刍抑制，不涨
+        # 30 天没人提：固定 τ=7 天只剩 1.4%，间隔回忆三次后还剩约一半
+        self.assertAlmostEqual(math.exp(-30 / 7.0), 0.0138, places=3)
+        spaced["last_access"] = now() - 30 * DAY
+        self.assertAlmostEqual(self.m.weight(spaced) / spaced["w0"], 0.512, places=2)
+
+    def test_stability_cap_and_legacy(self):
+        n = self.m.write("很重要的事", tier="normal")
+        n["stability"] = 360.0
+        n["last_access"] -= 300 * DAY
+        self.m._after_recall([n["id"]], now())
+        self.assertEqual(n["stability"], 365.0)
+        core = self.m.write("救命！太害怕了！哭了好久", source="owner")
+        core["last_access"] -= 3000 * DAY
+        self.m._after_recall([core["id"]], now())
+        self.assertEqual(self.m.stability(core), 3650.0)
+        legacy = self.m.write("旧版本写的记忆", tier="important")
+        legacy.pop("stability", None)
+        self.assertEqual(self.m.stability(legacy), 30.0)  # 旧存档没有这个字段，按等级取
 
     def test_flash(self):
         n = self.m.write("太害怕了！哭了好久！崩溃！", source="owner")
@@ -656,6 +690,146 @@ class TestCards(unittest.TestCase):
             self.assertEqual(b.card_line("1"), a.card_line("1"))
             self.assertEqual(b.card_line(SELF), a.card_line(SELF))
             self.assertIn("对主人的印象", b.card_text("1"))
+
+
+class TestHumanLikeMemory(unittest.TestCase):
+    """第三阶段：选择性记忆、反思、要义化、模糊回忆、前瞻记忆、情境相关回忆。"""
+
+    def make(self, d, card_reply=None, **kw):
+        a = Agent(Settings(data_dir=Path(d), owners={"1"}, quiet_start=0, quiet_end=0, **kw), random.Random(0))
+        a.weather["海"] = {"temp": 24, "humidity": 70, "wind": 8, "cloud": 0.3, "precipitation": 0}
+        self.chat, self.card = [], []
+
+        async def chat(messages, max_tokens, temperature):
+            self.chat.append(messages)
+            return "嗯嗯", 0, 0
+
+        async def card(messages, max_tokens, temperature):
+            self.card.append(messages)
+            return card_reply(messages) if card_reply else '{"profile": "p", "ops": []}', 0, 0
+
+        a.llm.backend = chat
+        a.card_backend = card
+        return a
+
+    def test_selective_encoding(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d)
+
+            async def run():
+                for t in ("嗯好的知道了", "好无聊啊", "我最喜欢的水果是草莓", "下周三我要去考驾照科目二"):
+                    await a.on_message(Incoming("2", "小红", t))
+                a._event("在书房读了一会儿书", memorable=True)
+                await a.job_ingest()
+
+            asyncio.run(run())
+            self.assertEqual(sorted(n["text"] for n in a.bank.stores["2"].nodes.values()),
+                             ["下周三我要去考驾照科目二", "我最喜欢的水果是草莓"])
+            self.assertTrue(all(n["importance"] >= 5 for n in a.bank.stores["2"].nodes.values()))
+            self.assertEqual(len(a.bank.stores[SELF].nodes), 1)  # 她自己的经历不受门槛限制
+            self.assertGreater(a.bank.meta["2"]["imp_acc"], 10)
+
+    def test_context_dependent_recall(self):
+        m = MemoryStore(rng=random.Random(0))
+        priv = m.write("我们聊过海边的日落很好看", ctx={"scene": "p", "place": "屋子", "slot": "晚上"})
+        grp = m.write("我们聊过海边的日落很好看呀", ctx={"scene": "g:g", "place": "码头", "slot": "晚上"})
+        q = "海边的日落"
+        in_group = m.retrieve(q, k=2, temperature=0, update=False, context={"scene": "g:g", "place": "码头", "slot": "早上"})
+        in_private = m.retrieve(q, k=2, temperature=0, update=False, context={"scene": "p", "place": "屋子", "slot": "晚上"})
+        self.assertEqual(in_group[0].node["id"], grp["id"])
+        self.assertEqual(in_private[0].node["id"], priv["id"])
+
+    def test_plan_extraction(self):
+        from core.prospect import cn_int, extract
+
+        today = date(2026, 10, 26)  # 周一
+        self.assertEqual(extract("下周三我要去考驾照", today)[0], date(2026, 11, 4))
+        self.assertEqual(extract("明天要面试", today)[0], date(2026, 10, 27))
+        self.assertEqual(extract("十二月二十号答辩", today)[0], date(2026, 12, 20))
+        self.assertEqual(extract("三天后出差", today)[0], date(2026, 10, 29))
+        self.assertEqual(extract("月底要搬家", today)[0], date(2026, 10, 31))
+        for t in ("你明天干嘛呀？", "明天天气怎么样", "我坐地铁2号线回家", "今天好累"):
+            self.assertIsNone(extract(t, today), t)
+        self.assertEqual([cn_int(s) for s in ("十", "十二", "二十", "二十三", "7", "两")], [10, 12, 20, 23, 7, 2])
+
+    def test_follow_up_after_the_day(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d)
+            asyncio.run(a.on_message(Incoming("1", "想睡觉", "明天要去面试，好紧张")))
+            asyncio.run(a.on_message(Incoming("2", "小红", "下周三我要考驾照")))
+            self.assertEqual(len(a.todos("1")), 1)
+            # 还没到日子：不追问，聊天时提醒「就在明天」
+            self.assertEqual(asyncio.run(a._follow_up_owner(12)), [])
+            asyncio.run(a.on_message(Incoming("1", "想睡觉", "今天加班到很晚")))
+            self.assertIn("就在明天", self.chat[-1][-1]["content"])
+            # 过了日子：主人收到一条主动的追问，只问一次
+            yesterday = (a._dt().date() - timedelta(days=1)).isoformat()
+            for uid in ("1", "2"):
+                a.bank.meta[uid]["todos"][0]["due"] = yesterday
+            a.last_owner_msg = a.last_proactive = 0
+            out = asyncio.run(a._follow_up_owner(12))
+            self.assertEqual([uid for uid, _ in out], ["1"])
+            self.assertEqual(asyncio.run(a._follow_up_owner(12)), [])
+            # 其他人：下次聊天时（哪怕只是寒暄）顺口问一次
+            asyncio.run(a.on_message(Incoming("2", "小红", "早")))
+            self.assertIn("可以顺便问问结果：TA之前说「下周三我要考驾照」", self.chat[-1][-1]["content"])
+            asyncio.run(a.on_message(Incoming("2", "小红", "早")))
+            self.assertNotIn("可以顺便问问", self.chat[-1][-1]["content"])
+            self.assertTrue(a.todos("2")[0]["asked"])
+
+    def test_fuzzy_recall(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d)
+            clear = a.bank.write("1", "我最喜欢的水果是草莓", tags=["user:1"])
+            faded = a.bank.write("1", "很久以前说过想去看极光", tags=["user:1"])
+            faded["w0"] = 0.5
+            block = a.memory_block([BankHit("1", Hit(clear, 1.0), 1.0), BankHit("1", Hit(faded, 1.0), 1.0)], "1")
+            self.assertIn("- 刚才：我最喜欢的水果是草莓", block)
+            self.assertIn("- 刚才（记不太清）：很久以前说过想去看极光", block)
+
+    def test_gist_old_memories(self):
+        def reply(messages):
+            return '{"1": "主人加班到深夜很累", "2": "原话更短也不改"}' if "压成一个要点" in messages[0]["content"] else '{}'
+
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d, card_reply=reply)
+            long_old = a.bank.write("1", "今天又加班到晚上十一点多才回家，地铁都快停了，真的好累啊", tags=["user:1"])
+            short_old = a.bank.write("1", "老板说下个月可能会涨工资但是我不太信", tags=["user:1"])
+            fresh = a.bank.write("1", "今天又加班到晚上十一点多才回家，地铁都快停了，真的好累", tags=["user:1"])
+            for n in (long_old, short_old):
+                n["created"] -= 10 * DAY
+            r = asyncio.run(a.job_consolidate())
+            self.assertEqual(r["gist"], 1)
+            self.assertEqual(long_old["text"], "主人加班到深夜很累")
+            self.assertTrue(long_old["verbatim"].startswith("今天又加班"))
+            self.assertEqual(short_old["text"], "老板说下个月可能会涨工资但是我不太信")  # 模型给的不更短就不改
+            self.assertNotIn("gisted", fresh)  # 不到一周不压
+            calls = len(self.card)
+            asyncio.run(a.job_consolidate())
+            self.assertEqual(len(self.card), calls)  # 压过的不再处理
+
+    def test_reflection_when_importance_adds_up(self):
+        def reply(messages):
+            if "insight" in messages[0]["content"]:
+                return '{"profile": "主人最近很忙", "ops": [], "insight": "最近压力很大，多关心少打趣"}'
+            return '{"profile": "主人最近很忙", "ops": []}'
+
+        with tempfile.TemporaryDirectory() as d:
+            a = self.make(d, card_reply=reply)
+            a.bank.write("1", "今天加班到很晚", tags=["user:1"])
+            asyncio.run(a.job_cards())
+            self.assertNotIn("insights", a.card("1"))  # 重要度还没攒够
+            for t in ("被老板骂了好难过", "妈妈生病住院了好害怕", "下周还要答辩压力好大", "失眠三天了好崩溃",
+                      "朋友结婚了我却开心不起来", "我决定月底要搬家了"):
+                a.bank.write("1", t, tags=["user:1"])
+            self.assertGreaterEqual(a.bank.meta["1"]["imp_acc"], REFLECT_THRESHOLD)
+            asyncio.run(a.job_cards())
+            self.assertIn("看法：最近压力很大，多关心少打趣", a.card_line("1"))
+            self.assertIn("看法", a.card_text("1"))
+            mine = [n for n in a.bank.stores["1"].nodes.values() if n["text"].startswith("（我的看法）")]
+            self.assertEqual(len(mine), 1)
+            self.assertIn("user:1", mine[0]["tags"])  # 看法来自私聊，群里同样不外传
+            self.assertEqual(a.bank.meta["1"]["imp_acc"], 0.0)
 
 
 class TestHostHooks(unittest.TestCase):

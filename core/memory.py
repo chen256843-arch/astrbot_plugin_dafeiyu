@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from . import gua
-from .util import DAY, HOUR, bigrams, char_set, clamp, containment, cosine, jaccard, now, tokens
+from .util import DAY, HOUR, bigrams, char_set, clamp, containment, cosine, jaccard, normalize, now, tokens
 
 try:  # numpy 只用于加速余弦，缺失时退化为纯 Python
     import numpy as _np
@@ -28,7 +29,9 @@ REGIONS = {
     "spatial": "空间",
     "self": "自我",
 }
-TAU_DAYS = {"core": 3650.0, "important": 30.0, "normal": 7.0}
+TAU_DAYS = {"core": 3650.0, "important": 30.0, "normal": 7.0}  # 稳定度的起点
+STABILITY_MAX = {"core": 3650.0, "important": 365.0, "normal": 365.0}
+SPACING_ALPHA = 1.5  # 间隔效应：S ← S·(1 + α·(1 − R))
 W_BASE = {"owner": 4.0, "other": 1.5, "self": 1.5}
 W0_CAP = 12.0
 HOT_CAPACITY = 5000
@@ -119,6 +122,57 @@ def extract_tags(text: str) -> list[str]:
     return [w for w in _TOPIC_WORDS if w in text]
 
 
+_PLAN_WORDS = ("明天", "后天", "下周", "下个月", "周末", "打算", "准备", "要去", "约好", "答应", "记得", "别忘", "提醒",
+               "考试", "面试", "出差", "生日", "搬家", "考")
+_PREF_WORDS = ("喜欢", "讨厌", "爱吃", "不吃", "过敏", "害怕", "最爱", "受不了")
+_PEOPLE_WORDS = ("妈妈", "爸爸", "爸妈", "家里", "朋友", "同学", "同事", "老板", "领导", "对象", "男朋友", "女朋友",
+                 "老公", "老婆", "孩子", "弟弟", "妹妹", "哥哥", "姐姐")
+_EPISODE_WORDS = ("今天", "昨天", "前天", "刚才", "刚刚", "这周", "上周")
+_SELF_FACT = re.compile(r"我(是|叫|在|住|的|喜欢|不喜欢|讨厌|爱|怕|最|今年|每天|一直|从来|养)")
+
+
+def importance_of(text: str, surprise: float = 1.0, source: str = "other") -> float:
+    """重要度 1–10（参考 Generative Agents，但用规则打分，不额外调用模型）。
+
+    情绪越强、和本人有关的事实、计划与约定、提到的人、新信息，越重要。
+    """
+    v, a = affect(text)
+    score = 2.0 + 3 * abs(v) + (2 if a >= 0.5 else 0)
+    if any(w in text for w in _PLAN_WORDS):
+        score += 3
+    if _SELF_FACT.search(text):
+        score += 2
+    if any(w in text for w in _PREF_WORDS):
+        score += 2
+    if any(w in text for w in _PEOPLE_WORDS):
+        score += 2
+    if any(w in text for w in _EPISODE_WORDS):
+        score += 1
+    if re.search(r"\d", text):
+        score += 1
+    if len(normalize(text)) >= 12:
+        score += 1
+    if surprise >= 0.6:
+        score += 1
+    if source == "owner":
+        score += 1
+    return round(min(10.0, score), 1)
+
+
+CTX_BOOST = {"scene": 1.10, "place": 1.05, "slot": 1.05}
+
+
+def context_boost(encoded: dict | None, now_ctx: dict | None) -> float:
+    """编码时的情境和此刻相同的维度各乘一点：同一个群/私聊 ×1.10，同一个地方 ×1.05，同一时段 ×1.05。"""
+    if not encoded or not now_ctx:
+        return 1.0
+    b = 1.0
+    for k, f in CTX_BOOST.items():
+        if encoded.get(k) and encoded.get(k) == now_ctx.get(k):
+            b *= f
+    return b
+
+
 def speaker_of(item: dict) -> str:
     """说话人：显式 speaker 字段 → user: 标签 → 角色自己（"self"）→ 未知（""）。"""
     if item.get("speaker"):
@@ -156,11 +210,25 @@ class MemoryStore:
         self._vec_cache: tuple | None = None
 
     # ------------------------------------------------------------------ 基础
+    @staticmethod
+    def stability(node: dict) -> float:
+        """稳定度 S（天）。起点是等级对应的 τ（7 / 30 / 3650），间隔着被想起后增长。"""
+        return node.get("stability") or TAU_DAYS.get(node.get("tier", "normal"), 7.0)
+
     def weight(self, node: dict, t: float | None = None) -> float:
-        """w(t) = w0 · exp(−Δt/τ)，Δt 自上次访问起算。"""
+        """w(t) = w0 · exp(−Δt/S)，Δt 自上次访问起算。"""
         t = t or now()
-        tau = TAU_DAYS.get(node.get("tier", "normal"), 7.0) * DAY
-        return node["w0"] * math.exp(-max(0.0, t - node["last_access"]) / tau)
+        return node["w0"] * math.exp(-max(0.0, t - node["last_access"]) / (self.stability(node) * DAY))
+
+    def _strengthen(self, node: dict, t: float) -> None:
+        """间隔效应：想起时越接近忘掉（清晰度 R 越低），稳定度涨得越多；刚想过又想几乎不涨。
+
+        R = exp(−Δt/S)，S ← min(上限, S · (1 + α · (1 − R)))。须在重置 last_access 之前调用。
+        """
+        s = self.stability(node)
+        r = math.exp(-max(0.0, t - node["last_access"]) / (s * DAY))
+        cap = max(s, STABILITY_MAX.get(node.get("tier", "normal"), 365.0))
+        node["stability"] = round(min(cap, s * (1 + SPACING_ALPHA * (1 - r))), 3)
 
     def degree(self, nid: str) -> int:
         return len(self.edges.get(nid, {}))
@@ -230,10 +298,11 @@ class MemoryStore:
         if text:
             self.pool.append({"text": text, "source": source, "ts": now(), **meta})
 
-    def judge(self, min_surprise: float = 0.12) -> list[dict]:
+    def judge(self, min_surprise: float = 0.12, min_importance: float | None = None) -> list[dict]:
         """候选池 → 判断阶段。过短、寒暄，或同一个人几乎重复说过的（只强化旧节点）不写入。
 
         别人说过相似的话不算重复：谁说的本身就是要记住的信息。
+        选择性编码：给出 min_importance 时，重要度不够的不记（她自己的经历已经挑过，不受此限）。
         """
         written: list[dict] = []
         pool, self.pool = self.pool, []
@@ -246,13 +315,28 @@ class MemoryStore:
             if s < min_surprise and sim_id:
                 self._rehearse(sim_id)
                 continue
-            written.append(self.write(text, **{k: v for k, v in c.items() if k != "ts"}, ts=c.get("ts")))
+            imp = importance_of(text, s, c.get("source", "other"))
+            if min_importance is not None and c.get("source") != "self" and imp < min_importance:
+                continue
+            written.append(self.write(text, **{k: v for k, v in c.items() if k != "ts"}, ts=c.get("ts"), importance=imp))
         return written
+
+    def rewrite(self, nid: str, text: str) -> None:
+        """改写一条记忆的文字（要义化用）：重建索引，向量作废待重新计算。权重、时间不变。"""
+        node = self.nodes[nid]
+        self._unindex(nid)
+        node.setdefault("verbatim", node["text"])
+        node["text"] = text
+        self._index(nid)
+        self.vectors.pop(nid, None)
+        self._vec_cache = None
 
     def _rehearse(self, nid: str, bonus: float = 0.3) -> None:
         node = self.nodes[nid]
-        node["w0"] = min(W0_CAP, self.weight(node) + bonus)
-        node["last_access"] = now()
+        t = now()
+        node["w0"] = min(W0_CAP, self.weight(node, t) + bonus)
+        self._strengthen(node, t)  # 同一个人又说了一遍，也是一次回忆
+        node["last_access"] = t
 
     def write(
         self,
@@ -267,10 +351,16 @@ class MemoryStore:
         link_to: Iterable[str] = (),
         speaker: str | None = None,
         speaker_name: str = "",
+        importance: float | None = None,
+        ctx: dict | None = None,
     ) -> dict:
-        """写入一条记忆。speaker 为说话人 QQ 号；角色自己的经历为 "self"；不给时从标签推断。"""
+        """写入一条记忆。speaker 为说话人 QQ 号；角色自己的经历为 "self"；不给时从标签推断。
+
+        ctx 是编码时的情境（scene 私聊/哪个群、place 她在哪、slot 一天中的时段），用于情境相关回忆。
+        """
         t = ts or now()
         s, _ = self.surprise(text)
+        imp = importance if importance is not None else importance_of(text, s, source)
         v, a = affect(text)
         valence = v if valence is None else valence
         arousal = a if arousal is None else arousal
@@ -301,6 +391,8 @@ class MemoryStore:
             "drive": infer_drive(text),
             "recalls": [],
             "merged": 0,
+            "importance": imp,
+            "ctx": dict(ctx or {}),
         }
         node["speaker"] = speaker if speaker is not None else speaker_of(node)
         self.nodes[nid] = node
@@ -399,8 +491,12 @@ class MemoryStore:
         update: bool = True,
         min_score: float = 0.08,
         speaker: str | None = None,
+        context: dict | None = None,
     ) -> list[Hit]:
-        """speaker 为当前说话人：他自己说过的事优先想起（×SPEAKER_BOOST）。"""
+        """speaker 为当前说话人：他自己说过的事优先想起（×SPEAKER_BOOST）。
+
+        context 为此刻的情境：和编码时情境相同的维度各乘一点（情境相关回忆，encoding specificity）。
+        """
         if not self.nodes:
             return []
         t = now()
@@ -437,8 +533,11 @@ class MemoryStore:
             rum = 0.75 ** (recent - 1) if recent >= 2 else 1.0
             jitter = 1.0 + self.rng.uniform(-JITTER, JITTER) * temperature
             s_boost = SPEAKER_BOOST if speaker and node.get("speaker") == speaker else 1.0
-            score = fused * node_w * d_bias * v_bias * r_boost * rum * s_boost * jitter
-            parts[nid].update(ppr=round(pr, 3), w=round(w, 3), region=r_boost, rum=round(rum, 3), speaker=s_boost)
+            c_boost = context_boost(node.get("ctx"), context)
+            score = fused * node_w * d_bias * v_bias * r_boost * rum * s_boost * c_boost * jitter
+            parts[nid].update(
+                ppr=round(pr, 3), w=round(w, 3), region=r_boost, rum=round(rum, 3), speaker=s_boost, ctx=round(c_boost, 3)
+            )
             scored.append((score, nid))
         scored.sort(reverse=True)
         pool = scored[: max(50, k * 8)]
@@ -485,6 +584,7 @@ class MemoryStore:
                 node["w0"] = self.weight(node, t) * 0.9
             else:  # 检索即强化
                 node["w0"] = min(W0_CAP, self.weight(node, t) + 0.4)
+                self._strengthen(node, t)
             node["last_access"] = t
         top = ids[:4]
         for i, a in enumerate(top):  # 共激活边
@@ -558,6 +658,7 @@ class MemoryStore:
         k["hits"] = k.get("hits", 0) + d.get("hits", 0)
         k["tags"] = sorted(set(k["tags"]) | set(d["tags"]))
         k["merged"] = k.get("merged", 0) + 1 + d.get("merged", 0)
+        k["stability"] = max(self.stability(k), self.stability(d))
         for dst, w in self.edges.get(drop, {}).items():
             self._link(keep, dst, w)
         for src, out in self.edges.items():

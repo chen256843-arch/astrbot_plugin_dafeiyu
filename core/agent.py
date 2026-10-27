@@ -9,11 +9,11 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import cards, gua, sun, weather
+from . import cards, gua, prospect, sun, weather
 from .collapse import collapse, pick
 from .drives import DRIVES, Drives
 from .ecology import CROPS, Ecology
@@ -69,6 +69,13 @@ DRIVE_PHRASES = {
     "recognition": "想被人夸夸",
     "achievement": "想把手头的事做完",
 }
+FUZZY_WEIGHT = 1.0  # 当前权重低于这个的记忆，呈现为「记不太清」
+GIST_AFTER_DAYS = 7  # 多久以前的聊天记忆在夜里压成要点
+GIST_MIN_CHARS = 24  # 比这短的不必压
+GIST_PER_NIGHT = 100  # 每晚最多压多少条
+REFLECT_THRESHOLD = 40.0  # 一个人累计的重要度到这个数，整理卡片时顺带反思一次
+TODO_MAX = 10  # 每人最多记几件待问的计划
+TODO_KEEP_DAYS = 7  # 过了日期几天后就忘掉
 CAT_WORDS = ("猫", "小灰")
 MONEY_WORDS = ("钱", "金币", "买", "卖", "穷", "富")
 
@@ -105,6 +112,8 @@ class Settings:
     price_out: float = 0.008
     hot_capacity: int = 5000
     tz: str = "Asia/Shanghai"
+    encode_min_importance: float = 5.0  # 选择性编码：重要度（1–10）低于这个的聊天不记
+    followup_enabled: bool = True  # 记住别人说过的计划，过了那天主动问问
     card_enabled: bool = True
     card_min_new: int = 3  # 一个人至少有几条新记忆才调用模型更新他的卡片
     card_max_people: int = 30  # 每次最多整理几个人，控制费用
@@ -242,7 +251,13 @@ class Agent:
         self.events.append({"ts": now(), "text": text})
         self.events = self.events[-200:]
         if memorable:
-            self.bank.propose(SELF, text, source="self", tags=["自主", *tags])
+            self.bank.propose(SELF, text, source="self", tags=["自主", *tags], ctx=self.ctx_now())
+
+    def ctx_now(self, group_id: str | None = None) -> dict:
+        """此刻的情境：在哪个场合（私聊 / 哪个群）、她在哪、一天中的哪个时段。"""
+        h = self._dt().hour
+        slot = "深夜" if h < 6 else "早上" if h < 11 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
+        return {"scene": f"g:{group_id}" if group_id else "p", "place": self.world.her_location(), "slot": slot}
 
     def _home_weather(self) -> dict:
         w = self.weather.get(self.s.home)
@@ -311,8 +326,81 @@ class Agent:
             msg = self._decide(t, hour)
             if msg:
                 out.extend((uid, msg) for uid in self.s.owners)
+        if not out:
+            out.extend(await self._follow_up_owner(hour))
         self.ok("tick")
         return out
+
+    # ================================================================ 前瞻记忆
+    def _note_plan(self, uid: str, text: str) -> None:
+        """别人说了带日期的计划 → 记成待问的事。每人最多留 TODO_MAX 件。"""
+        if not self.s.followup_enabled:
+            return
+        found = prospect.extract(text, self._dt().date())
+        if not found:
+            return
+        due, what = found
+        todos = self.bank.meta.setdefault(uid, {"name": "", "last": 0.0}).setdefault("todos", [])
+        if any(td["text"] == what for td in todos):
+            return
+        todos.append({"text": what, "due": due.isoformat(), "created": now(), "asked": 0.0})
+        del todos[:-TODO_MAX]
+
+    def todos(self, uid: str) -> list[dict]:
+        """还没过期的计划（过了日期 TODO_KEEP_DAYS 天的自动忘掉）。"""
+        today = self._dt().date()
+        items = self.bank.meta.get(uid, {}).get("todos", [])
+        keep = [td for td in items if (today - date.fromisoformat(td["due"])).days <= TODO_KEEP_DAYS]
+        if len(keep) != len(items):
+            self.bank.meta[uid]["todos"] = keep
+        return keep
+
+    def _todo_lines(self, uid: str) -> list[str]:
+        """〈此刻〉里提醒她：对方快到日子的事，和已经过了日子、还没问过的事（提一次就算问过）。"""
+        today = self._dt().date()
+        lines = []
+        for td in self.todos(uid):
+            due = date.fromisoformat(td["due"])
+            n = (due - today).days
+            if n < 0 and not td["asked"]:
+                lines.append(f"可以顺便问问结果：TA之前说「{td['text']}」，那是{prospect.day_label(due, today)}的事")
+                td["asked"] = now()
+            elif 0 <= n <= 2:
+                lines.append(f"TA说过「{td['text']}」，就在{prospect.day_label(due, today)}")
+        return lines
+
+    async def _follow_up_owner(self, hour: int) -> list[tuple[str, str]]:
+        """主人说过的事过了日子还没问 → 主动发一句问问（不在免打扰时段，离上次主动消息 ≥ 1 小时）。"""
+        if not (self.s.followup_enabled and self.s.proactive) or self._quiet(hour):
+            return []
+        t = now()
+        if t - self.last_proactive < HOUR or t - self.last_owner_msg < 30 * 60:
+            return []
+        today = self._dt().date()
+        for uid in self.s.owners:
+            for td in self.todos(uid):
+                due = date.fromisoformat(td["due"])
+                if due >= today or td["asked"]:
+                    continue
+                text = None
+                if self.llm.enabled:
+                    text = await self.llm.chat(
+                        [
+                            {"role": "system", "content": f"你是「{self.s.name}」。{self.s.persona}"},
+                            {
+                                "role": "user",
+                                "content": f"主人{prospect.day_label(due, today)}说过「{td['text']}」，那天已经过了。"
+                                "用一句 20 字以内、口语化的话主动问问结果，只输出这句话。",
+                            },
+                        ],
+                        max_tokens=60,
+                        temperature=0.8,
+                    )
+                td["asked"] = t
+                self.last_proactive = t
+                self._event(f"问了主人「{td['text']}」怎么样了")
+                return [(uid, text or f"诶，你之前说「{td['text']}」，后来怎么样啦？")]
+        return []
 
     def _set_activity(self, name: str, hours: float, basis: str) -> None:
         self.activity = {"name": name, "until": now() + hours * HOUR, "basis": basis}
@@ -510,7 +598,7 @@ class Agent:
         self.ok("weather")
 
     async def job_ingest(self, batch: int = 50) -> dict:
-        written = self.bank.judge()
+        written = self.bank.judge(lambda key: None if key == SELF else self.s.encode_min_importance)
         backend = self.embedder.backend
         missing = self.bank.missing_vectors(backend)[:batch]
         if missing:
@@ -554,6 +642,7 @@ class Agent:
                 if s:
                     summaries[(key, tag)] = s
         report = self.bank.consolidate(lambda key, tag, ids: summaries.get((key, tag)))
+        report["gist"] = await self._gist_old_memories()
         self.ok("consolidate")
         return report
 
@@ -606,6 +695,15 @@ class Agent:
         past = cards.past_facts(c)
         if past:
             lines.append("以前：" + "；".join(f"{f['text']}（{time_label(f['until'], now_dt, self.tz)}变了）" for f in past))
+        for ins in c.get("insights", []):
+            lines.append(f"看法（{time_label(ins['ts'], now_dt, self.tz)}）：{ins['text']}")
+        todos = self.todos(key)
+        if todos:
+            today = now_dt.date()
+            lines.append("记着的事：" + "；".join(
+                f"{td['text']}（{prospect.day_label(date.fromisoformat(td['due']), today)}"
+                f"{'，已问过' if td['asked'] else ''}）" for td in todos
+            ))
         return "\n".join(lines)
 
     def _new_memories(self, key: str, since: float, limit: int = 30) -> list[str]:
@@ -638,7 +736,7 @@ class Agent:
                 continue
             card = self.card(key) or cards.empty_card()
             new = self._new_memories(key, card.get("updated", 0.0))
-            need = self.s.card_min_new if card.get("updated") else 1
+            need = self.s.card_min_new if card.get("updated") and not self._reflect_due(key) else 1
             if new and (force or len(new) >= need):
                 cands.append((len(new), key, new))
             else:
@@ -655,7 +753,10 @@ class Agent:
     async def _update_card(self, key: str, new: list[str]) -> bool:
         t0 = now()  # 以发请求前为准：等待期间新写入的记忆留到下次
         card = self.card(key) or cards.empty_card()
-        messages = cards.update_messages(self.s.name, self._whose(key), card, new, self.summaries.get(f"p:{key}", ""))
+        reflect = self._reflect_due(key)
+        messages = cards.update_messages(
+            self.s.name, self._whose(key), card, new, self.summaries.get(f"p:{key}", ""), reflect=reflect
+        )
         out = await self.llm.chat(messages, max_tokens=400, temperature=0.2, backend=self.card_backend)
         data = cards.parse_json(out)
         if data is None:
@@ -666,8 +767,67 @@ class Agent:
             card["profile"] = profile[: cards.PROFILE_MAX]
         cards.apply_ops(card, data.get("ops", []), t0)
         card["updated"] = t0
-        self.bank.meta.setdefault(key, {"name": "", "last": 0.0})["card"] = card
+        meta = self.bank.meta.setdefault(key, {"name": "", "last": 0.0})
+        meta["card"] = card
+        if reflect:
+            insight = cards.add_insight(card, data.get("insight", ""), t0)
+            if insight:  # 看法也记进这个人的库，被问起时能想起来
+                self.bank.write(
+                    key, f"（我的看法）{insight}", source="self", region="semantic", tier="important",
+                    tags=["反思", f"user:{key}"],
+                )
+            meta["imp_acc"] = 0.0
         return True
+
+    def _reflect_due(self, key: str) -> bool:
+        return self.bank.meta.get(key, {}).get("imp_acc", 0.0) >= REFLECT_THRESHOLD
+
+    # ================================================================ 要义化
+    async def _gist_old_memories(self) -> int:
+        """一周以前、较长的聊天记忆压成要点：原话的细节淡去，意思留下（模糊痕迹理论）。
+
+        每个人一次调用，最多 20 条；每晚最多 GIST_PER_NIGHT 条。用整理卡片的模型。
+        """
+        if not self.llm.enabled:
+            return 0
+        t = now()
+        cutoff = t - GIST_AFTER_DAYS * DAY
+        done = 0
+        for key, st in list(self.bank.stores.items()):
+            if done >= GIST_PER_NIGHT:
+                break
+            items = [
+                n for n in st.nodes.values()
+                if n["region"] == "episodic" and not n.get("gisted") and n["created"] < cutoff
+                and len(n["text"]) >= GIST_MIN_CHARS
+            ][: min(20, GIST_PER_NIGHT - done)]
+            if not items:
+                continue
+            numbered = "\n".join(f"{i}. {n['text']}" for i, n in enumerate(items, 1))
+            out = await self.llm.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "把下面每条记忆压成一个要点（15 字以内），保留人物、事实和情绪，丢掉原话的细节。"
+                        '按编号只输出一个 JSON，例如 {"1": "要点", "2": "要点"}。',
+                    },
+                    {"role": "user", "content": numbered},
+                ],
+                max_tokens=40 * len(items),
+                temperature=0.2,
+                backend=self.card_backend,
+            )
+            data = cards.parse_json(out)
+            if data is None:
+                log.warning("压缩 %s 的旧记忆失败：%s", key, (out or "")[:80])
+                continue
+            for i, n in enumerate(items, 1):
+                gist = str(data.get(str(i), "")).strip()[:30]
+                if gist and len(gist) < len(n["text"]):
+                    st.rewrite(n["id"], gist)
+                    done += 1
+                n["gisted"] = t  # 压过或模型认为不必压，都不再重复处理
+        return done
 
     async def _update_self_card(self, force: bool = False) -> bool:
         t0 = now()
@@ -733,7 +893,11 @@ class Agent:
             )
             if not bypass and self.rng.random() >= p:
                 if r >= 2:
-                    self.bank.propose(uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags)
+                    self.bank.propose(
+                        uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags,
+                        ctx=self.ctx_now(msg.group_id),
+                    )
+                    self._note_plan(uid, text)
                 return None
             self.social.mark_replied(msg.group_id)
 
@@ -743,7 +907,10 @@ class Agent:
                 self._feed_link()
 
         # 记进说话人自己的小库：在谁的库里就是谁说的，不必再在文字里标
-        self.bank.propose(uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags)
+        self.bank.propose(
+            uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags, ctx=self.ctx_now(msg.group_id)
+        )
+        self._note_plan(uid, text)
 
         reply = await self._reply(msg, is_owner)
         self.drives.satisfy("social", 15 if is_owner else 6)
@@ -777,7 +944,11 @@ class Agent:
 
         reply = None
         if self.llm.enabled:
-            content = user_line if light else f"{self._context_block(uid, msg, hits, weights)}\n{user_line}"
+            todo = self._todo_lines(uid)
+            if light:  # 寒暄不带〈此刻〉，除非有过了日子该问问的事
+                content = f"〈此刻〉\n" + "\n".join(todo) + f"\n〈/此刻〉\n{user_line}" if todo else user_line
+            else:
+                content = f"{self._context_block(uid, msg, hits, weights, todo)}\n{user_line}"
             messages = [
                 {"role": "system", "content": self._system_prompt(uid, msg, key)},
                 *hist,
@@ -815,6 +986,7 @@ class Agent:
             drive_bias=self.drives.drive_bias,
             mood=self.drives.mood,
             temperature=temp,
+            context=self.ctx_now(msg.group_id),
         )
         if hits:
             floor = max(RECALL_FLOOR, RECALL_RELATIVE * hits[0].score)
@@ -936,7 +1108,11 @@ class Agent:
         order = sorted(groups, key=lambda k: (k != uid, k == SELF))  # 对方的在前，她自己的在后
         parts = []
         for key in order:
-            lines = [f"- {time_label(h.node['created'], now_dt, self.tz)}：{h.node['text']}" for h in groups[key]]
+            st = self.bank.stores[key]
+            lines = []
+            for h in groups[key]:
+                vague = "（记不太清）" if st.weight(h.node) < FUZZY_WEIGHT else ""
+                lines.append(f"- {time_label(h.node['created'], now_dt, self.tz)}{vague}：{h.node['text']}")
             parts.append(f"〔{self.memory_header(key, uid)}〕\n" + "\n".join(lines))
         return "\n".join(parts)
 
@@ -1002,7 +1178,12 @@ class Agent:
         return "。".join(parts) + "。"
 
     def _context_block(
-        self, uid: str, msg: Incoming, hits: list[BankHit], weights: dict[str, float] | None = None
+        self,
+        uid: str,
+        msg: Incoming,
+        hits: list[BankHit],
+        weights: dict[str, float] | None = None,
+        todo: list[str] | None = None,
     ) -> str:
         """每轮都变的部分，附在这句话前面（在请求的最末尾，不影响前面的缓存）。
 
@@ -1019,8 +1200,9 @@ class Agent:
             for key in weights or {}:
                 if key not in (uid, SELF) and weights[key] >= 1.0 and self.card_line(key):
                     lines.append(f"你对{self._whose(key)}的印象：{self.card_line(key)}")
+        lines.extend(todo or [])
         if hits:
-            lines.append("想起的事（按人分组，前面是大概时间）：")
+            lines.append("想起的事（按人分组，前面是大概时间；标「记不太清」的只记得个大概）：")
             lines.append(self.memory_block(hits, uid))
         lines.append("〈/此刻〉")
         return "\n".join(lines)

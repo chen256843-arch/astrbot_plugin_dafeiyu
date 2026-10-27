@@ -62,6 +62,8 @@ class DaFeiYu(Star):
             price_out=float(config.get("price_out", 0.008)),
             hot_capacity=int(config.get("hot_capacity", 5000)),
             tz=config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai",
+            encode_min_importance=float(config.get("encode_min_importance", 5)),
+            followup_enabled=bool(config.get("followup_enabled", True)),
             card_enabled=bool(config.get("card_enabled", True)),
             card_min_new=int(config.get("card_min_new", 3)),
             card_max_people=int(config.get("card_max_people", 30)),
@@ -492,7 +494,9 @@ class DaFeiYu(Star):
             yield event.plain_result("这个只有主人能用哦")
             return
         r = await self.agent.job_consolidate()
-        yield event.plain_result(f"重放{r['replay']} 合并{r['merge']} 抽象{r['abstract']} 剪边{r['prune']} 下沉{r['forget']}")
+        yield event.plain_result(
+            f"重放{r['replay']} 合并{r['merge']} 抽象{r['abstract']} 剪边{r['prune']} 下沉{r['forget']} 压成要点{r.get('gist', 0)}"
+        )
 
     @filter.command("整理卡片")
     async def cmd_update_cards(self, event: AstrMessageEvent):

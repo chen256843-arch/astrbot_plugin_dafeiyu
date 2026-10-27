@@ -116,6 +116,23 @@
     "type": "bool",
     "default": true
   },
+  "encode_min_importance": {
+    "description": "记忆门槛（重要度 1–10）",
+    "type": "float",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 0.5
+    },
+    "hint": "每句话按规则打一个重要度：有情绪、关于本人的事实、计划和约定、提到的人、新信息越多越高；主人说的加 1。低于门槛的不记（「嗯好的」约 3，「我最喜欢草莓」约 8）。调低记得多、调高记得精。"
+  },
+  "followup_enabled": {
+    "description": "记住别人说的计划，过了日子问问",
+    "type": "bool",
+    "default": true,
+    "hint": "认出「下周三考驾照」「明天面试」这类带日期的话。过了那天：主人会收到她主动发的一句问候（需要开启主动消息，不在免打扰时段）；其他人下次聊天时她会顺口问问。"
+  },
   "segment_reply": {
     "description": "逐句分条发送",
     "type": "string",

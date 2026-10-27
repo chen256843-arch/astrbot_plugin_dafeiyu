@@ -72,17 +72,24 @@ class MemoryBank:
         kw.setdefault("speaker", key)
         kw.setdefault("speaker_name", name)
         node = self.store(key, name).write(text, **kw)
-        self.meta[key]["last"] = now()
+        self._noted(key, node)
         self.evict_overflow()
         return node
 
+    def _noted(self, key: str, node: dict) -> None:
+        """记下一条：更新最后活跃时间，累计重要度（攒够了就该反思一次）。"""
+        m = self.meta[key]
+        m["last"] = now()
+        m["imp_acc"] = round(m.get("imp_acc", 0.0) + node.get("importance", 0.0), 1)
+
     # ------------------------------------------------------------------ 定时任务
-    def judge(self) -> list[tuple[str, dict]]:
+    def judge(self, min_importance: Callable[[str], float | None] | None = None) -> list[tuple[str, dict]]:
+        """各小库的候选池过一遍判断；min_importance(key) 给出该库的重要度门槛（None 不设）。"""
         written = []
         for key, st in self.stores.items():
-            for node in st.judge():
+            for node in st.judge(min_importance=min_importance(key) if min_importance else None):
                 written.append((key, node))
-                self.meta[key]["last"] = now()
+                self._noted(key, node)
         self.evict_overflow()
         return written
 

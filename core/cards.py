@@ -15,6 +15,8 @@ FACT_MAX = 24
 FACTS_CURRENT_MAX = 12
 FACTS_PAST_MAX = 6
 SELF_MAX = 60
+INSIGHT_MAX = 30
+INSIGHTS_KEEP = 3
 
 
 def empty_card() -> dict:
@@ -60,7 +62,7 @@ def apply_ops(card: dict, ops: list, t: float) -> dict:
     return done
 
 
-def render(card: dict | None, max_chars: int = 160) -> str:
+def render(card: dict | None, max_chars: int = 200) -> str:
     """给模型看的一行：印象｜记得的事实（以前：…）。"""
     if not card or not (card.get("profile") or current_facts(card)):
         return ""
@@ -71,7 +73,18 @@ def render(card: dict | None, max_chars: int = 160) -> str:
     past = [f["text"] for f in sorted(past_facts(card), key=lambda f: f["until"])[-2:]]
     if past:
         text += "（以前：" + "；".join(past) + "）"
+    insights = card.get("insights") or []
+    if insights:
+        text += "｜看法：" + insights[-1]["text"]
     return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+
+
+def add_insight(card: dict, text: str, t: float) -> str:
+    text = str(text or "").strip()[:INSIGHT_MAX]
+    if text:
+        card.setdefault("insights", []).append({"text": text, "ts": t})
+        del card["insights"][:-INSIGHTS_KEEP]
+    return text
 
 
 def parse_json(text: str | None) -> dict | None:
@@ -88,12 +101,18 @@ def parse_json(text: str | None) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def update_messages(bot_name: str, who: str, card: dict, memories: list[str], recap: str = "") -> list[dict]:
-    """让模型更新对某人的印象卡。who 是这个人的称呼（主人 / 昵称）。"""
+def update_messages(
+    bot_name: str, who: str, card: dict, memories: list[str], recap: str = "", reflect: bool = False
+) -> list[dict]:
+    """让模型更新对某人的印象卡。who 是这个人的称呼（主人 / 昵称）。
+
+    reflect：这段时间重要的事攒够了，顺带要一条更高层的看法（参考 Generative Agents 的反思）。
+    """
     facts = "\n".join(f"{i}. {f['text']}" for i, f in enumerate(current_facts(card), 1)) or "（无）"
+    shape = '{"profile": "...", "ops": [...], "insight": "..."}' if reflect else '{"profile": "...", "ops": [...]}'
     system = (
         f"你在帮陪伴角色「{bot_name}」整理她对「{who}」的印象卡。根据现有卡片和新的记忆，只输出一个 JSON：\n"
-        '{"profile": "...", "ops": [...]}\n'
+        f"{shape}\n"
         f"- profile：{PROFILE_MAX} 字以内，第三人称，写{who}是谁、和她的关系、最近在忙什么、有什么还没了结的事。\n"
         f"- ops：对「现有事实」的修改。事实是关于{who}本人、比较稳定的信息（生日、喜好、职业、家人、住处、习惯等），"
         f"每条 {FACT_MAX} 字以内。\n"
@@ -101,6 +120,11 @@ def update_messages(bot_name: str, who: str, card: dict, memories: list[str], re
         '不再成立 {"op":"remove","id":序号}。没有变化就给空列表。\n'
         "- 只根据记忆里明确说过的内容，不要猜测；临时的小事不算事实。"
     )
+    if reflect:
+        system += (
+            f"\n- insight：{INSIGHT_MAX} 字以内，她从这些事里得出的一条更高层的看法或该怎么对待{who}"
+            "（例如「最近压力很大，多关心少打趣」），要有记忆依据。"
+        )
     user = f"【现有卡片】\nprofile：{card.get('profile') or '（空）'}\n现有事实：\n{facts}\n【新的记忆】\n" + "\n".join(
         f"- {m}" for m in memories
     )
