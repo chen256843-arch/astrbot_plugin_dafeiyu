@@ -18,8 +18,9 @@ from .drives import DRIVES, Drives
 from .ecology import CROPS, Ecology
 from .economy import INCOME, Economy
 from .embedding import Embedder
+from .bank import SELF, BankHit, MemoryBank, time_label
 from .llm import LLM
-from .memory import REGIONS, MemoryStore, affect
+from .memory import REGIONS, affect
 from .social import BOUNDARY, Social
 from .util import DAY, HOUR, atomic_write_json, now, read_json
 from .world import LANDMARKS, World
@@ -82,7 +83,7 @@ class Agent:
         self.s = settings
         self.rng = rng or random.Random()
         self.drives = Drives()
-        self.memory = MemoryStore(capacity=settings.hot_capacity, rng=self.rng)
+        self.bank = MemoryBank(capacity=settings.hot_capacity, rng=self.rng)
         self.world = World(self.rng)
         self.eco = Ecology(self.rng)
         self.econ = Economy()
@@ -110,12 +111,26 @@ class Agent:
     @property
     def _paths(self) -> tuple[Path, Path, Path]:
         d = self.s.data_dir
-        return d / "state.json", d / "memory.json", d / "vectors.json"
+        return d / "state.json", d / "memory", d / "memory.json"
 
     def load(self) -> None:
-        sp, mp, vp = self._paths
+        sp, bank_dir, legacy = self._paths
         st = read_json(sp, {})
-        self.memory = MemoryStore.from_dict(read_json(mp, None), read_json(vp, {}), capacity=self.s.hot_capacity, rng=self.rng)
+        if (bank_dir / "index.json").exists():
+            self.bank = MemoryBank.load(bank_dir, self.s.hot_capacity, self.rng)
+        elif legacy.exists():
+            # 0.4 及以前：单一 memory.json → 按说话人拆成小库，旧文件改名留底
+            vectors = legacy.with_name("vectors.json")
+            self.bank = MemoryBank.from_legacy(
+                read_json(legacy, {}), read_json(vectors, {}), self.s.hot_capacity, self.rng
+            )
+            self.bank.save(bank_dir)
+            for f in (legacy, vectors):
+                if f.exists():
+                    f.replace(f.with_name(f.name + ".bak-v0.4"))
+            log.info("记忆已按人拆分为 %d 个小库", len(self.bank.stores))
+        else:
+            self.bank = MemoryBank(self.s.hot_capacity, self.rng)
         self.drives = Drives.from_dict(st.get("drives"))
         self.world = World.from_dict(st.get("world"), self.rng)
         self.eco = Ecology.from_dict(st.get("eco"), self.rng)
@@ -134,7 +149,7 @@ class Agent:
         self.host = st.get("host", {})
 
     def save(self) -> None:
-        sp, mp, vp = self._paths
+        sp, bank_dir, _ = self._paths
         self.ok("save")
         atomic_write_json(
             sp,
@@ -157,8 +172,7 @@ class Agent:
                 "host": self.host,
             },
         )
-        atomic_write_json(mp, self.memory.to_dict())
-        atomic_write_json(vp, self.memory.vectors_dict())
+        self.bank.save(bank_dir)
 
     def _dt(self) -> datetime:
         """角色所在时区的当前时间（容器默认 UTC，作息不能跟着它走）。"""
@@ -172,7 +186,7 @@ class Agent:
         self.events.append({"ts": now(), "text": text})
         self.events = self.events[-200:]
         if memorable:
-            self.memory.propose(text, source="self", tags=["自主", *tags])
+            self.bank.propose(SELF, text, source="self", tags=["自主", *tags])
 
     def _home_weather(self) -> dict:
         w = self.weather.get(self.s.home)
@@ -440,35 +454,36 @@ class Agent:
         self.ok("weather")
 
     async def job_ingest(self, batch: int = 50) -> dict:
-        written = self.memory.judge()
+        written = self.bank.judge()
         backend = self.embedder.backend
-        missing = self.memory.missing_vectors(backend)[:batch]
+        missing = self.bank.missing_vectors(backend)[:batch]
         if missing:
-            texts = [self.memory.nodes[i]["text"] for i in missing]
+            texts = [self.bank.stores[key].nodes[nid]["text"] for key, nid in missing]
             used, vecs = await self.embedder.embed(texts)
-            for nid, v in zip(missing, vecs):
-                self.memory.set_vector(nid, used, v)
+            for (key, nid), v in zip(missing, vecs):
+                self.bank.stores[key].set_vector(nid, used, v)
         self.ok("ingest")
         return {"written": len(written), "embedded": len(missing)}
 
     def job_maintain(self) -> dict:
-        fixed = self.memory.maintain()
+        fixed = self.bank.maintain()
         self.ok("maintain")
         return fixed
 
-    def _plan_key(self, tag: str, ids: list[str]) -> tuple[str, str]:
-        node = next((self.memory.nodes[i] for i in ids if i in self.memory.nodes), {})
-        return tag, node.get("speaker", "")
+    def _whose(self, key: str) -> str:
+        """某个小库在提示词里的称呼。"""
+        if key == SELF:
+            return "你自己"
+        return self.name_of(key, self.bank.name(key))
 
     async def job_consolidate(self) -> dict:
         summaries: dict[tuple[str, str], str] = {}
         if self.llm.enabled:
-            for tag, ids in self.memory.abstraction_plans():
-                key = self._plan_key(tag, ids)
-                src = [self.memory.nodes[i] for i in ids[:8] if i in self.memory.nodes]
+            for key, tag, ids in self.bank.abstraction_plans():
+                st = self.bank.stores[key]
+                src = [st.nodes[i] for i in ids[:8] if i in st.nodes]
                 texts = "\n".join(f"- {n['text']}" for n in src)
-                sp = key[1]
-                whose = "你自己的经历" if sp == "self" else f"「{self.name_of(sp, src[0].get('speaker_name', ''))}」说的" if sp else "来源不明"
+                whose = "你自己的经历" if key == SELF else f"「{self._whose(key)}」说的"
                 s = await self.llm.chat(
                     [
                         {
@@ -481,10 +496,8 @@ class Agent:
                     temperature=0.3,
                 )
                 if s:
-                    summaries[key] = s
-        report = self.memory.consolidate(
-            lambda tag, ids: summaries.get(self._plan_key(tag, ids)) or self.memory.template_abstraction(tag, ids)
-        )
+                    summaries[(key, tag)] = s
+        report = self.bank.consolidate(lambda key, tag, ids: summaries.get((key, tag)))
         self.ok("consolidate")
         return report
 
@@ -506,7 +519,7 @@ class Agent:
             picks = today[-3:]
             text = f"今天{'，'.join(picks)}。心情{self.mood_word()}。"
         self.diaries.append({"date": self._dt().strftime("%Y-%m-%d"), "text": text})
-        self.memory.write(text, source="self", region="episodic", tags=["日记"])
+        self.bank.write(SELF, text, source="self", region="episodic", tags=["日记"])
         self.ok("diary")
         return text
 
@@ -522,7 +535,7 @@ class Agent:
             problems.append("玻恩概率未归一")
         if any(not 0 <= self.drives.value[d] <= 100 for d in DRIVES):
             problems.append("驱力越界")
-        fixed = self.memory.maintain()
+        fixed = self.bank.maintain()
         if fixed:
             problems.append(f"图结构被修复：{fixed}")
         self.ok("selftest")
@@ -554,13 +567,7 @@ class Agent:
             )
             if not bypass and self.rng.random() >= p:
                 if r >= 2:
-                    self.memory.propose(
-                        f"{msg.nick or '一位群友'}在群里说：{text}",
-                        source="owner" if is_owner else "other",
-                        tags=tags,
-                        speaker=uid,
-                        speaker_name=msg.nick,
-                    )
+                    self.bank.propose(uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags)
                 return None
             self.social.mark_replied(msg.group_id)
 
@@ -569,14 +576,8 @@ class Agent:
             if not msg.group_id and ATE_PATTERN.search(text):
                 self._feed_link()
 
-        speaker = "主人" if is_owner else msg.nick or "对方"
-        self.memory.propose(
-            f"{speaker}说：{text}",
-            source="owner" if is_owner else "other",
-            tags=tags,
-            speaker=uid,
-            speaker_name=msg.nick,
-        )
+        # 记进说话人自己的小库：在谁的库里就是谁说的，不必再在文字里标
+        self.bank.propose(uid, text, name=msg.nick, source="owner" if is_owner else "other", tags=tags)
 
         reply = await self._reply(msg, is_owner)
         self.drives.satisfy("social", 15 if is_owner else 6)
@@ -599,18 +600,18 @@ class Agent:
         uid = str(msg.uid)
         _, vecs = await self.embedder.embed([msg.text])
         temp_label, temp = self.drives.recall_temperature(self.rng)
-        hits = self.memory.retrieve(
+        weights = self.bank.route(msg.text, uid, self._aliases())
+        hits = self.bank.retrieve(
             msg.text,
+            weights,
             k=6,
+            visible=lambda key, node: self._visible(key, node, uid, msg.group_id),
             query_vec=vecs[0] if vecs else None,
             backend=self.embedder.backend,
             drive_bias=self.drives.drive_bias,
             mood=self.drives.mood,
             temperature=temp,
-            speaker=uid,
         )
-        if msg.group_id:
-            hits = [h for h in hits if self._visible_in_group(h.node, uid)]
 
         key = f"g:{msg.group_id}" if msg.group_id else f"p:{uid}"
         hist = self.history.setdefault(key, [])
@@ -629,43 +630,67 @@ class Agent:
         del hist[:-20]
         return reply
 
-    @staticmethod
-    def _visible_in_group(node: dict, uid: str) -> bool:
-        """群聊里只用：群聊记忆、自主记忆、或说话人自己的记忆；别人的私聊不外传。"""
-        tags = node.get("tags", [])
-        if any(t.startswith("group:") for t in tags):
+    def _visible(self, key: str, node: dict, uid: str, group_id: str | None) -> bool:
+        """这条记忆此刻能不能用。
+
+        - 对方自己的库、她自己的经历：都能用
+        - 别人的库：群聊里只用在这个群里说过的；私聊里主人可以问起任何人，其他人只能听到别人在群里公开说过的
+        """
+        if key in (uid, SELF):
             return True
-        users = [t for t in tags if t.startswith("user:")]
-        return not users or f"user:{uid}" in users
+        groups = [t for t in node.get("tags", []) if t.startswith("group:")]
+        if group_id:
+            return f"group:{group_id}" in groups
+        return self.social.is_owner(uid) or bool(groups)
+
+    def _aliases(self) -> dict[str, list[str]]:
+        """每个小库能被点名的称呼：当前昵称、库里记的昵称，主人另加「主人」。"""
+        out: dict[str, list[str]] = {}
+        for key in self.bank.stores:
+            if key == SELF:
+                continue
+            names = [self.social.rel.get(key, {}).get("nick", ""), self.bank.name(key)]
+            if self.social.is_owner(key):
+                names.append("主人")
+            out[key] = [n for n in names if n]
+        return out
 
     def name_of(self, uid: str, fallback: str = "") -> str:
-        """说话人现在的称呼：主人 → 当前昵称 → 记忆里的旧昵称 → 一位群友。不把 QQ 号交给模型。"""
+        """某人现在的称呼：主人 → 当前昵称 → 记忆里的旧昵称 → 一位群友。不把 QQ 号交给模型。"""
         if self.social.is_owner(uid):
             return "主人"
         nick = self.social.rel.get(uid, {}).get("nick", "")
         return nick or fallback or "一位群友"
 
-    def speaker_label(self, node: dict, uid: str) -> str:
-        """这条记忆是谁说的，相对当前说话人 uid 而言。"""
-        sp = node.get("speaker", "")
-        if sp == "self":
+    def memory_header(self, key: str, uid: str) -> str:
+        """提示词里一个小库的标题，相对当前说话人 uid 而言。"""
+        if key == SELF:
             return "你自己的经历"
-        if not sp:
-            return "不确定是谁说的"
-        if sp == uid:
-            return "主人（就是对方）说的" if self.social.is_owner(uid) else "对方本人说的"
-        return f"{self.name_of(sp, node.get('speaker_name', ''))}说的（不是对方）"
+        if key == uid:
+            return "主人（就是对方）说过的" if self.social.is_owner(uid) else "对方说过的"
+        return f"{self._whose(key)}说过的（不是对方）"
+
+    def memory_block(self, hits: list[BankHit], uid: str) -> str:
+        """按小库分组，每条只标大概时间。"""
+        if not hits:
+            return "（没有想起什么相关的）"
+        now_dt = self._dt()
+        groups: dict[str, list[BankHit]] = {}
+        for h in hits:
+            groups.setdefault(h.key, []).append(h)
+        order = sorted(groups, key=lambda k: (k != uid, k == SELF))  # 对方的在前，她自己的在后
+        parts = []
+        for key in order:
+            lines = [f"- {time_label(h.node['created'], now_dt, self.tz)}：{h.node['text']}" for h in groups[key]]
+            parts.append(f"〔{self.memory_header(key, uid)}〕\n" + "\n".join(lines))
+        return "\n".join(parts)
 
     def _system_prompt(self, uid: str, msg: Incoming, hits) -> str:
         tier = self.social.tier(uid)
         rel = self.social.rel.get(uid, {})
         w = self._home_weather()
         cat = self.world.agents["小灰"]
-        mem_lines = "\n".join(
-            f"- 【{self.speaker_label(h.node, uid)}】{h.node['text']}"
-            f"（{datetime.fromtimestamp(h.node['created'], self.tz).strftime('%m-%d')}）"
-            for h in hits
-        ) or "（没有想起什么相关的）"
+        mem_lines = self.memory_block(hits, uid)
         taboos = "、".join(rel.get("taboos", [])) or "无"
         where = "群聊" if msg.group_id else "私聊"
         persona = self.s.group_persona if (msg.group_id and self.s.group_persona) else self.s.persona
@@ -674,7 +699,7 @@ class Agent:
             f"【此刻】{self._dt().strftime('%H:%M')}，{weather.describe(w)}。你在{self.location_text()}，正在{self.activity['name']}。"
             f"心情{self.mood_word()}。驱力：{self.drives.summary()}。小灰{cat['mode']}中。金币 {self.econ.coins}。\n"
             f"【对方】{msg.nick or uid}（{where}），关系：{tier}。相处边界：{BOUNDARY[tier]}。禁忌话题：{taboos}\n"
-            f"【想起的记忆】每条都标了是谁说的或经历的：\n{mem_lines}\n"
+            f"【想起的记忆】按人分组，每条前面是大概时间：\n{mem_lines}\n"
             "【说话方式】像发 QQ 消息一样口语化，一般 1–3 句，不用 markdown 和列表。只根据上面的记忆谈过去的事，记不清就直说。"
             "提到记忆时分清是谁说的：别人说的事不要说成是对方说的，也不要把对方说过的话安到别人头上。"
             "如果对方认真地问你是不是 AI、有没有意识，要诚实说明你是由程序驱动的角色，没有真实的主观感受。"
@@ -723,35 +748,48 @@ class Agent:
         lines.append("库存：" + (" ".join(f"{k}{v}" for k, v in self.eco.pantry.items() if v) or "空"))
         return "\n".join(lines)
 
-    def memory_text(self, query: str) -> str:
-        hits = self.memory.retrieve(query, k=6, drive_bias=self.drives.drive_bias, mood=self.drives.mood, update=False)
+    def _store_label(self, key: str) -> str:
+        return "她自己" if key == SELF else f"{self._whose(key)}({key})"
+
+    def memory_text(self, query: str, uid: str = "") -> str:
+        """调试用：按 uid 来问时会调用哪些小库、想起哪些记忆。"""
+        weights = self.bank.route(query, uid, self._aliases())
+        hits = self.bank.retrieve(
+            query, weights, k=6, visible=lambda key, node: self._visible(key, node, uid, None),
+            drive_bias=self.drives.drive_bias, mood=self.drives.mood, update=False,
+        )
+        routed = "、".join(f"{self._store_label(k)}×{w}" for k, w in weights.items()) or "无"
         if not hits:
-            return "没有想起相关的记忆"
-        lines = []
+            return f"调用：{routed}\n没有想起相关的记忆"
+        now_dt = self._dt()
+        lines = [f"调用：{routed}"]
         for h in hits:
             n = h.node
-            bits = gua.bits_str(gua.node_bits(n, self.memory.degree(n["id"])))
-            sp = n.get("speaker", "")
-            who = "她自己" if sp == "self" else "未知" if not sp else f"{self.name_of(sp, n.get('speaker_name', ''))}({sp})"
+            st = self.bank.stores[h.key]
+            bits = gua.bits_str(gua.node_bits(n, st.degree(n["id"])))
+            p = h.hit.parts
             lines.append(
-                f"{n['id']} [{REGIONS[n['region']]}/{n['tier']}] {h.gua}({bits}) 分{h.score:.2f} "
-                f"cos{h.parts.get('cos', 0):.2f} lex{h.parts.get('lex', 0):.2f} w{h.parts.get('w', 0):.2f}\n"
-                f"  来源：{who}\n  {n['text'][:60]}"
+                f"{self._store_label(h.key)}·{n['id']} [{REGIONS[n['region']]}/{n['tier']}] {h.hit.gua}({bits}) "
+                f"分{h.score:.2f} cos{p.get('cos', 0):.2f} lex{p.get('lex', 0):.2f} w{p.get('w', 0):.2f}\n"
+                f"  {time_label(n['created'], now_dt, self.tz)}：{n['text'][:60]}"
             )
         return "\n".join(lines)
 
     def memory_stats_text(self) -> str:
-        st = self.memory.stats()
+        st = self.bank.stats()
         regions = " ".join(f"{REGIONS.get(k, k)}{v}" for k, v in st["regions"].items())
-        return f"热库 {st['hot']}/{self.memory.capacity} 冷库 {st['cold']} 边 {st['edges']} 向量 {st['vectors']} 候选池 {st['pool']}\n分区：{regions}"
+        return (
+            f"热库 {st['hot']}/{self.bank.capacity} 冷库 {st['cold']} 边 {st['edges']} 向量 {st['vectors']} 候选池 {st['pool']}\n"
+            f"记忆库：{st['people']} 个人 + 她自己\n分区：{regions}"
+        )
 
     def remember(self, text: str, uid: str) -> str:
-        n = self.memory.write(
+        n = self.bank.write(
+            uid,
             text,
+            name=self.social.rel.get(uid, {}).get("nick", ""),
             source="owner" if self.social.is_owner(uid) else "other",
             tier="core",
             tags=[f"user:{uid}"],
-            speaker=uid,
-            speaker_name=self.social.rel.get(uid, {}).get("nick", ""),
         )
-        return f"记住了（{n['id']}，{REGIONS[n['region']]}，{self.memory.gua_of(n['id'])}）"
+        return f"记住了（{n['id']}，{REGIONS[n['region']]}，{self.bank.stores[uid].gua_of(n['id'])}）"

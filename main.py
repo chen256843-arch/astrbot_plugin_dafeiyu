@@ -296,7 +296,8 @@ class DaFeiYu(Star):
             yield event.plain_result("这个只有主人能用哦")
             return
         q = " ".join(self._args(event))
-        yield event.plain_result(self.agent.memory_text(q) if q else self.agent.memory_stats_text())
+        uid = str(event.get_sender_id())
+        yield event.plain_result(self.agent.memory_text(q, uid) if q else self.agent.memory_stats_text())
 
     @filter.command("记住")
     async def cmd_remember(self, event: AstrMessageEvent):

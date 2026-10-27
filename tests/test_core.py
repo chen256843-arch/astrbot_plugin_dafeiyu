@@ -1,17 +1,19 @@
 """核心算法测试（不依赖 AstrBot）。运行：python -m unittest discover -s tests"""
 import asyncio
+import json
 import math
 import random
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import gua, sun  # noqa: E402
 from core.agent import Agent, Incoming, Settings  # noqa: E402
+from core.bank import SELF, BankHit, MemoryBank, time_label  # noqa: E402
 from core.collapse import born, collapse  # noqa: E402
 from core.drives import Drives  # noqa: E402
 from core.ecology import Ecology  # noqa: E402
@@ -280,24 +282,122 @@ class TestSpeakerMemory(unittest.TestCase):
         self.assertEqual(m.nodes["m2"]["speaker"], "self")
         self.assertEqual(m.maintain(), {})
 
-    def test_prompt_labels_who_said_it(self):
+class TestMemoryBank(unittest.TestCase):
+    """每人一个小记忆库 + 大记忆路由。"""
+
+    def bank(self):
+        b = MemoryBank(rng=random.Random(0))
+        b.write("1", "我下周要考试", name="想睡觉", source="owner", tags=["user:1"])
+        b.write("2", "我下周要搬家", name="小红", tags=["user:2"])
+        b.write("2", "我在群里说过我养了只橘猫", name="小红", tags=["user:2", "group:g"])
+        b.write(SELF, "在书房读了一会儿书", source="self")
+        return b
+
+    def test_route(self):
+        b = self.bank()
+        aliases = {"1": ["想睡觉", "主人"], "2": ["小红"]}
+        self.assertEqual(b.route("你好呀", "1", aliases), {"1": 1.0, SELF: 0.9})
+        self.assertEqual(b.route("小红最近在忙什么", "1", aliases), {"1": 1.0, SELF: 0.9, "2": 1.0})
+        self.assertEqual(b.route("主人最近怎么样", "2", aliases), {"2": 1.0, SELF: 0.9, "1": 1.0})
+        self.assertEqual(b.route("大家最近都在干嘛", "9", aliases), {SELF: 0.9, "1": 0.8, "2": 0.8})
+
+    def test_joint_retrieval_and_privacy(self):
         with tempfile.TemporaryDirectory() as d:
             a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            a.bank = self.bank()
             a.social.touch("2", "小红")
-            mine = a.memory.write("主人说：我下周要考试", speaker="1")
-            hers = a.memory.write("小红说：我下周要搬家", speaker="2", speaker_name="小红")
-            own = a.memory.write("在书房读了一会儿书", source="self")
-            hits = [Hit(n, 1.0) for n in (mine, hers, own)]
-            to_owner = a._system_prompt("1", Incoming("1", "主人", "hi"), hits)
-            self.assertIn("【主人（就是对方）说的】主人说：我下周要考试", to_owner)
-            self.assertIn("【小红说的（不是对方）】小红说：我下周要搬家", to_owner)
-            self.assertIn("【你自己的经历】在书房读了一会儿书", to_owner)
-            to_red = a._system_prompt("2", Incoming("2", "小红", "hi"), hits)
-            self.assertIn("【对方本人说的】小红说：我下周要搬家", to_red)
-            self.assertIn("【主人说的（不是对方）】", to_red)
-            self.assertNotIn("1", a.speaker_label(mine, "2").replace("主人", ""))  # 不把 QQ 号交给模型
+            a.social.touch("3", "路人")
 
-    def test_on_message_records_speaker(self):
+            def recall(uid, q, gid=None):
+                w = a.bank.route(q, uid, a._aliases())
+                hits = a.bank.retrieve(q, w, k=6, visible=lambda k, n: a._visible(k, n, uid, gid), update=False)
+                return {(h.key, h.node["text"]) for h in hits}
+
+            # 主人私聊问小红：能联合调用小红的库
+            self.assertIn(("2", "我下周要搬家"), recall("1", "小红下周要干什么"))
+            # 路人私聊问小红：只听得到小红在群里公开说过的
+            got = recall("3", "小红下周要干什么，她养了什么")
+            self.assertNotIn(("2", "我下周要搬家"), got)
+            self.assertIn(("2", "我在群里说过我养了只橘猫"), got)
+            # 群 g 里：只用在群 g 说过的；别的群里一条都不用
+            self.assertNotIn(("2", "我下周要搬家"), recall("3", "小红下周要干什么", "g"))
+            self.assertFalse({k for k, _ in recall("3", "小红养了什么", "h")} & {"2"})
+
+    def test_prompt_groups_by_person_with_rough_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
+            a.bank = self.bank()
+            a.social.touch("2", "小红")
+            hits = [BankHit(k, Hit(n, 1.0), 1.0) for k, st in a.bank.stores.items() for n in st.nodes.values()]
+            to_owner = a.memory_block(hits, "1")
+            self.assertTrue(to_owner.startswith("〔主人（就是对方）说过的〕\n- 刚才：我下周要考试"))
+            self.assertIn("〔小红说过的（不是对方）〕\n- 刚才：我下周要搬家", to_owner)
+            self.assertTrue(to_owner.rstrip().endswith("〔你自己的经历〕\n- 刚才：在书房读了一会儿书"))
+            to_red = a.memory_block(hits, "2")
+            self.assertTrue(to_red.startswith("〔对方说过的〕"))
+            self.assertIn("〔主人说过的（不是对方）〕", to_red)
+            self.assertNotIn("想睡觉", to_red + to_owner)  # 主人一律称「主人」
+            self.assertNotRegex(to_red + to_owner, r"\(\d+\)|\b[12]\b")  # 不把 QQ 号交给模型
+
+    def test_time_label(self):
+        tz = timezone.utc
+        now_dt = datetime(2026, 10, 26, 20, 0, tzinfo=tz)
+        ts = lambda **kw: (now_dt - timedelta(**kw)).timestamp()  # noqa: E731
+        cases = [
+            (ts(minutes=5), "刚才"), (ts(hours=5), "今天"), (ts(days=1), "昨天"), (ts(days=2), "前天"),
+            (ts(days=4), "4天前"), (ts(days=9), "上周"), (ts(days=20), "2周前"), (ts(days=70), "2个月前"),
+            (ts(days=800), "2年前"),
+        ]
+        for t, want in cases:
+            self.assertEqual(time_label(t, now_dt, tz), want)
+
+    def test_global_capacity(self):
+        b = MemoryBank(capacity=3, rng=random.Random(0))
+        for i, key in enumerate(["1", "2", "1", "3", "2"]):
+            b.write(key, f"第{i}条完全不同的记忆{'甲乙丙丁戊'[i] * 4}")
+        self.assertEqual(b.total(), 3)
+        self.assertEqual(sum(len(st.cold) for st in b.stores.values()), 2)
+
+    def test_consolidate_per_person(self):
+        b = MemoryBank(rng=random.Random(0))
+        for t in ("我家猫今天打翻了水杯", "我家猫昨天抓了一只虫", "我家猫跟着我去了码头"):
+            b.write("1", t, name="小明", region="episodic", tags=["猫", "user:1"])
+        b.write("2", "我也喜欢猫", name="小红", region="episodic", tags=["猫", "user:2"])
+        report = b.consolidate()
+        self.assertEqual(report["abstract"], 1)
+        self.assertTrue(any(n["region"] == "semantic" for n in b.stores["1"].nodes.values()))
+        self.assertFalse(any(n["region"] == "semantic" for n in b.stores["2"].nodes.values()))
+
+    def test_save_load_and_legacy_migration(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old = MemoryStore(rng=random.Random(0))
+            a = old.write("我喜欢草莓", tags=["user:1"], speaker="1", speaker_name="小明")
+            b = old.write("我喜欢蓝莓", tags=["user:2"], speaker="2", speaker_name="小红")
+            c = old.write("在书房读了一会儿书", source="self")
+            old.set_vector(a["id"], "hash512", hash_embed(a["text"]))
+            (d / "memory.json").write_text(json.dumps(old.to_dict(), ensure_ascii=False), encoding="utf-8")
+            (d / "vectors.json").write_text(json.dumps(old.vectors), encoding="utf-8")
+
+            ag = Agent(Settings(data_dir=d), random.Random(0))
+            ag.load()
+            self.assertEqual({k: set(st.nodes) for k, st in ag.bank.stores.items()},
+                             {"1": {a["id"]}, "2": {b["id"]}, SELF: {c["id"]}})
+            self.assertIn(a["id"], ag.bank.stores["1"].vectors)
+            self.assertEqual(ag.bank.name("2"), "小红")
+            self.assertFalse(any(ag.bank.stores["1"].edges.get(a["id"], {})))  # 跨库的时间边不保留
+            self.assertFalse((d / "memory.json").exists())
+            self.assertTrue((d / "memory.json.bak-v0.4").exists())
+            new = ag.bank.write("1", "我还喜欢西瓜")
+            self.assertNotIn(new["id"], {a["id"], b["id"], c["id"]})  # 新 id 不和迁移来的重复
+
+            ag.save()
+            again = Agent(Settings(data_dir=d), random.Random(0))
+            again.load()
+            self.assertEqual({k: set(st.nodes) for k, st in again.bank.stores.items()},
+                             {k: set(st.nodes) for k, st in ag.bank.stores.items()})
+
+    def test_on_message_goes_to_speaker_store(self):
         with tempfile.TemporaryDirectory() as d:
             a = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
 
@@ -307,9 +407,14 @@ class TestSpeakerMemory(unittest.TestCase):
                 await a.job_ingest()
 
             asyncio.run(run())
-            nodes = sorted(a.memory.nodes.values(), key=lambda n: n["speaker"])
-            self.assertEqual([(n["speaker"], n["speaker_name"]) for n in nodes], [("1", "想睡觉"), ("2", "小红")])
-            self.assertIn("来源：主人(1)", a.memory_text("草莓"))
+            self.assertEqual([n["text"] for n in a.bank.stores["1"].nodes.values()], ["我最喜欢的水果是草莓"])
+            red = list(a.bank.stores["2"].nodes.values())
+            self.assertEqual(len(red), 1)
+            self.assertIn("group:g", red[0]["tags"])
+            self.assertEqual(a.bank.name("2"), "小红")
+            text = a.memory_text("草莓", "1")
+            self.assertIn("主人(1)·m", text)
+            self.assertIn("刚才：我最喜欢的水果是草莓", text)
 
 
 class TestHostHooks(unittest.TestCase):
@@ -378,12 +483,14 @@ class TestAgent(unittest.TestCase):
 
             diary = asyncio.run(run())
             self.assertTrue(diary)
-            self.assertIn("草莓", a.memory_text("喜欢什么水果"))
+            self.assertIn("草莓", a.memory_text("喜欢什么水果", "1"))
             self.assertEqual(a.job_selftest(), [])
             a.save()
             b = Agent(Settings(data_dir=Path(d), owners={"1"}), random.Random(0))
             b.load()
-            self.assertEqual(b.memory.nodes.keys(), a.memory.nodes.keys())
+            ids = lambda ag: {(k, n) for k, st in ag.bank.stores.items() for n in st.nodes}  # noqa: E731
+            self.assertEqual(ids(b), ids(a))
+            self.assertIn("1", b.bank.stores)
 
 
 if __name__ == "__main__":
